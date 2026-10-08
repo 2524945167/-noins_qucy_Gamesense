@@ -1,17 +1,31 @@
 local bit = require("bit")
-local json_ok, json = pcall(require, "json")
+local call_errors = {}
+local function checked_call(context, fn, ...)
+    local ok, a, b, c, d = pcall(fn, ...)
+    if not ok then
+        local now, message = globals.realtime(), tostring(a)
+        local previous = call_errors[context]
+        if not previous or previous.message ~= message or now < previous.time or now-previous.time >= 5 then
+            client.error_log("[Ünoins_qucy] " .. context .. ": " .. message)
+            call_errors[context] = {time=now, message=message}
+        end
+    end
+    return ok, a, b, c, d
+end
+local json_ok, json = checked_call("optional dependency", require, "json")
 local clipboard
 do
-    local ok_cp, cp = pcall(require, "gamesense/clipboard")
+    local ok_cp, cp = checked_call("optional dependency", require, "gamesense/clipboard")
     if ok_cp and cp and type(cp) == "table" and cp.get and cp.set then
         clipboard = cp
     else
         local ffi = require("ffi")
-        pcall(ffi.cdef, [[
+        checked_call("optional dependency", ffi.cdef, [[
             typedef void* HANDLE;
             typedef void* HGLOBAL;
             typedef void* HWND;
             typedef unsigned int UINT;
+            HWND GetActiveWindow(void);
             bool OpenClipboard(HWND hWndNewOwner);
             bool CloseClipboard(void);
             bool EmptyClipboard(void);
@@ -21,51 +35,52 @@ do
             void* GlobalLock(HGLOBAL hMem);
             bool GlobalUnlock(HGLOBAL hMem);
             HGLOBAL GlobalFree(HGLOBAL hMem);
+            size_t GlobalSize(HGLOBAL hMem);
         ]])
         local user32 = ffi.load("user32.dll")
         local kernel32 = ffi.load("kernel32.dll")
         clipboard = {
             get = function()
-                local ok, ret = pcall(function()
-                    if not user32.OpenClipboard(nil) then return "" end
-                    local hMem = user32.GetClipboardData(1)
-                    if hMem == nil then
-                        user32.CloseClipboard()
-                        return ""
-                    end
-                    local ptr = kernel32.GlobalLock(hMem)
-                    if ptr == nil then
-                        user32.CloseClipboard()
-                        return ""
-                    end
-                    local str = ffi.string(ptr)
-                    kernel32.GlobalUnlock(hMem)
-                    user32.CloseClipboard()
-                    return str
+                assert(user32.OpenClipboard(nil), "clipboard: OpenClipboard failed")
+                local memory, pointer
+                local ok, text = pcall(function()
+                    memory = user32.GetClipboardData(1)
+                    if memory == nil then return "" end
+                    local size = tonumber(kernel32.GlobalSize(memory))
+                    assert(size and size > 0 and size <= 2097153, "clipboard: invalid or oversized text")
+                    pointer = kernel32.GlobalLock(memory)
+                    assert(pointer ~= nil, "clipboard: GlobalLock failed")
+                    local bytes = ffi.string(pointer, size)
+                    local finish = bytes:find("\0", 1, true)
+                    assert(finish, "clipboard: text is not NUL-terminated")
+                    return bytes:sub(1, finish-1)
                 end)
-                return ok and ret or ""
+                if pointer ~= nil then kernel32.GlobalUnlock(memory) end
+                user32.CloseClipboard()
+                if not ok then error(text, 0) end
+                return text
             end,
             set = function(text)
-                local ok, ret = pcall(function()
-                    if not user32.OpenClipboard(nil) then return false end
-                    user32.EmptyClipboard()
-                    text = tostring(text)
-                    local len = #text + 1
-                    local hMem = kernel32.GlobalAlloc(0x0042, len)
-                    if hMem == nil then
-                        user32.CloseClipboard()
-                        return false
-                    end
-                    local ptr = kernel32.GlobalLock(hMem)
-                    if ptr ~= nil then
-                        ffi.copy(ptr, text, len)
-                        kernel32.GlobalUnlock(hMem)
-                        user32.SetClipboardData(1, hMem)
-                    end
+                text = tostring(text)
+                local memory = kernel32.GlobalAlloc(0x0042, #text+1)
+                assert(memory ~= nil, "clipboard: GlobalAlloc failed")
+                local pointer = kernel32.GlobalLock(memory)
+                if pointer == nil then kernel32.GlobalFree(memory); error("clipboard: GlobalLock failed") end
+                ffi.copy(pointer, text, #text)
+                ffi.cast("char*", pointer)[#text] = 0
+                kernel32.GlobalUnlock(memory)
+                local owner = user32.GetActiveWindow()
+                if owner == nil or not user32.OpenClipboard(owner) then
+                    kernel32.GlobalFree(memory)
+                    error("clipboard: active window unavailable or OpenClipboard failed")
+                end
+                if not user32.EmptyClipboard() or user32.SetClipboardData(1, memory) == nil then
                     user32.CloseClipboard()
-                    return true
-                end)
-                return ok and ret or false
+                    kernel32.GlobalFree(memory)
+                    error("clipboard: SetClipboardData failed")
+                end
+                user32.CloseClipboard()
+                return true
             end
         }
     end
@@ -74,8 +89,8 @@ end
 local TAB, CON = "AA", "Anti-aimbot angles"
 
 local function safe_ref(tab, con, name)
-    local ok, a, b = pcall(ui.reference, tab, con, name)
-    return ok and a, ok and b
+    local ok, a, b, c = checked_call("safe_ref", ui.reference, tab, con, name)
+    if ok then return a, b, c end
 end
 local N = {}
 N.enabled = safe_ref(TAB, CON, "Enabled")
@@ -100,25 +115,41 @@ do
     local a, b = safe_ref(TAB, "Other", "Leg movement"); other_hide[#other_hide+1] = a; other_hide[#other_hide+1] = b
 end
 
-local function hide_native()
-    for _, v in pairs(N) do if v then pcall(ui.set_visible, v, false) end end
-    for _, v in ipairs(other_hide) do if v then pcall(ui.set_visible, v, false) end end
+local function native_visible(visible)
+    for _, ref in pairs(N) do if ref then ui.set_visible(ref, visible) end end
+    for _, ref in ipairs(other_hide) do if ref then ui.set_visible(ref, visible) end end
 end
 
-local function show_native()
-    for _, v in pairs(N) do if v then pcall(ui.set_visible, v, true) end end
-    for _, v in ipairs(other_hide) do if v then pcall(ui.set_visible, v, true) end end
+local native_hotkey_modes = {"Always on", "On hotkey", "Toggle", "Off hotkey"}
+local native_snapshot
+
+local function capture_native()
+    if native_snapshot then return end
+    local snapshot = {}
+    for key, ref in pairs(N) do
+        if ref then
+            if key == "fs_mode" then
+                local ok, _, mode, hotkey = checked_call("capture_native", ui.get, ref)
+                if ok and native_hotkey_modes[(tonumber(mode) or -1) + 1] then
+                    snapshot[key] = {native_hotkey_modes[mode + 1], tonumber(hotkey) or 0}
+                end
+            else
+                local ok, value = checked_call("capture_native", ui.get, ref)
+                if ok and value ~= nil then snapshot[key] = {value} end
+            end
+        end
+    end
+    native_snapshot = snapshot
 end
 
 local function reset_native()
-    local function s(r, v) if r then pcall(ui.set, r, v) end end
-    s(N.enabled, false); s(N.pitch, "Off"); s(N.pitch_add, 0)
-    s(N.yaw_base, "Local view"); s(N.yaw, "Off"); s(N.yaw_add, 0)
-    s(N.yaw_jitter, "Off"); s(N.yaw_jit_add, 0)
-    s(N.body_yaw, "Off"); s(N.body_yaw_add, 0)
-    s(N.fs_body, false); s(N.edge_yaw, false)
-    s(N.freestand, false); s(N.fs_mode, "Always on")
-    s(N.roll, 0); s(N.fake_enabled, false)
+    local snapshot = native_snapshot
+    native_snapshot = nil
+    if not snapshot then return end
+    for key, values in pairs(snapshot) do
+        local ref = N[key]
+        if ref then checked_call("restore native " .. key, function() ui.set(ref, unpack(values)) end) end
+    end
 end
 local aa_decision = {
     active = false,
@@ -163,7 +194,7 @@ local function aa_commit()
     for i = 1, #aa_decision.refs do
         local ref = aa_decision.refs[i]
         local request = ref and aa_decision.requests[ref]
-        if request then pcall(ui.set, ref, request.value) end
+        if request then ui.set(ref, request.value) end
     end
     aa_decision.requests = {}
 end
@@ -184,7 +215,8 @@ local function nset(ref, val)
         end
         return true
     end
-    return pcall(ui.set, ref, val)
+    ui.set(ref, val)
+    return true
 end
 local freestand_requested, freestand_applied = false, false
 local freestand_mode_ready = false
@@ -200,29 +232,22 @@ local function apply_native_freestand(active)
     if not freestand_mode_ready then
         freestand_mode_ready = nset(N.fs_mode, "Always on")
     end
-    local current
-    if N.freestand then
-        local ok, value = pcall(ui.get, N.freestand)
-        if ok then current = value end
-    end
-    if current ~= active and not nset(N.freestand, active) then
-        freestand_applied = false
-        return
-    end
-    local ok, value = pcall(ui.get, N.freestand)
-    freestand_applied = ok and value == active
+    if not N.freestand then freestand_applied=false; return end
+    if ui.get(N.freestand) ~= active then nset(N.freestand, active) end
+    freestand_applied = active and ui.get(N.freestand) == true
 end
-local master = ui.new_checkbox(TAB, CON, "\aFFF59DFFÜnoins")
+
+local master = ui.new_checkbox(TAB, CON, "\aFFF59DFFÜnoins_qucy")
 local page_sel = ui.new_combobox(TAB, CON, "Page", "Home", "\aFFF59DFFAnti-Aim\r", "Misc", "Visuals")
 
 local function get_saved_config_names()
-    local ok, list = pcall(database.read, "unoins_cfg_list")
+    local ok, list = checked_call("get_saved_config_names", database.read, "unoins_cfg_list")
     if ok and type(list) == "table" and #list > 0 then return list end
     return { "default" }
 end
 
 local function save_config_names_list(list)
-    pcall(database.write, "unoins_cfg_list", list)
+    database.write("unoins_cfg_list", list)
 end
 local active_config_names = get_saved_config_names()
 local cfg_listbox = ui.new_listbox(TAB, CON, "Configs", active_config_names)
@@ -232,7 +257,7 @@ local cfg_save_btn = ui.new_button(TAB, CON, "Save", function() end)
 local cfg_delete_btn = ui.new_button(TAB, CON, "Delete", function() end)
 local cfg_import_btn = ui.new_button(TAB, CON, "Import from clipboard", function() end)
 local cfg_export_btn = ui.new_button(TAB, CON, "Export to clipboard", function() end)
-local defensive_backend = ui.new_combobox(TAB, "Fake lag", "Defensive mode", "\a87B313FFGamesense\r", "\aFFF59DFFÜnoins\r", "\aFF9C9CFFÜnoins Pro\r")
+local defensive_backend = ui.new_combobox(TAB, "Fake lag", "Defensive mode", "\a87B313FFGamesense\r", "\aFFF59DFFÜnoins_qucy\r", "\aFF9C9CFFÜnoins_qucy Pro\r")
 local pro = {state={}, reset=function() end}
 pro.duck = safe_ref("RAGE", "Other", "Duck peek assist")
 local safe_head_weapons = ui.new_multiselect(TAB, "Fake lag", "Safe head", "Knife", "Taser", "Glock-18")
@@ -244,6 +269,7 @@ local fs_states = ui.new_multiselect(TAB, "Fake lag", "Freestanding states", "St
 local fs_options = ui.new_multiselect(TAB, "Fake lag", "Freestanding options", "Disable yaw jitter", "Disable body yaw")
 local edge_hotkey = ui.new_hotkey(TAB, "Fake lag", "Edge yaw", false)
 local anti_backstab = ui.new_checkbox(TAB, "Fake lag", "Anti backstab")
+local fl_ground_mode = ui.new_combobox(TAB, "Fake lag", "Adaptive ground fake lag", "Low choke", "Maximum")
 local _, slow_key = safe_ref(TAB, "Other", "Slow motion")
 local condition_sel = ui.new_combobox(TAB, CON, "Condition",
     "Global", "Standing", "Moving", "Slowwalk", "Air", "Air+", "Duck", "Duck move", "Freestanding")
@@ -264,7 +290,7 @@ function extras.header(page, group, name)
 end
 extras.header("Visuals", CON, "SCOPE / AIMING")
 extras.add("scope", "checkbox", "Visuals", CON, nil, "Scope Lines")
-extras.add("scope_color", "color_picker", "Visuals", CON, "scope", "Scope accent", 255, 156, 156, 235)
+extras.add("scope_color", "color_picker", "Visuals", CON, "scope", "Scope accent", 255, 255, 255, 235)
 extras.add("scope_style", "combobox", "Visuals", CON, "scope", "Scope style", "Soft", "Classic", "Diagonal")
 extras.add("scope_exclude", "multiselect", "Visuals", CON, "scope", "Hidden arms", "Top", "Bottom", "Left", "Right")
 extras.add("scope_length", "slider", "Visuals", CON, "scope", "Scope length", 20, 260, 105, true, "px")
@@ -277,46 +303,66 @@ extras.add("velocity_color", "color_picker", "Visuals", "Fake lag", "velocity", 
 extras.add("velocity_x", "slider", "Visuals", "Fake lag", "velocity", "Momentum horizontal", 5, 95, 50, true, "%")
 extras.add("velocity_y", "slider", "Visuals", "Fake lag", "velocity", "Momentum vertical", 5, 95, 32, true, "%")
 extras.add("velocity_scale", "slider", "Visuals", "Fake lag", "velocity", "Momentum size", 75, 150, 100, true, "%")
-local indicator_sel = ui.new_combobox(TAB, "Fake lag", "Indicator", "Off", "Ünoins", "Half-life", "Ideal yaw")
+local indicator_sel = ui.new_combobox(TAB, "Fake lag", "Indicator", "Off", "Ünoins_qucy", "Half-life", "Ideal yaw", "Ünoins_qucy new")
+local qucy_color = ui.new_color_picker(TAB, "Fake lag", "\nIndicator accent color", 168, 230, 163, 255)
+extras.ui.qucy_color = qucy_color
+extras.controls[#extras.controls+1] = {key="qucy_color", ref=qucy_color, kind="color_picker", page="Visuals", indicator="Ünoins_qucy new"}
+extras.add("qucy_offset", "slider", "Visuals", "Fake lag", nil, "New indicator offset", 20, 180, 28, true, "px")
+extras.controls[#extras.controls].indicator = "Ünoins_qucy new"
 local ind_groupname = ui.new_checkbox(TAB, "Fake lag", "Indicator group name")
 local dmg_indicator = ui.new_checkbox(TAB, "Fake lag", "Damage ind")
 extras.header("Misc", CON, "COMBAT / MOVEMENT")
-extras.add("onshot", "checkbox", "Misc", CON, nil, "Shot Sync")
-extras.add("autostop", "checkbox", "Misc", CON, nil, "Ünoins Brake")
+extras.add("onshot", "checkbox", "Misc", CON, nil, "\aFFF59DFFon shot sync\r")
+extras.add("move_hitchance", "checkbox", "Misc", CON, nil, "Double tap release hitchance")
+extras.add("move_hitchance_weapons", "multiselect", "Misc", CON, "move_hitchance", "Release weapons", "SSG 08", "SCAR-20", "G3SG1", "AWP", "Desert Eagle", "R8 Revolver")
+extras.add("move_hitchance_value", "slider", "Misc", CON, "move_hitchance", "Release hit chance", 0, 100, 60, true, "%")
+extras.add("noscope_hitchance", "checkbox", "Misc", CON, nil, "No scope hit chance")
+extras.add("noscope_weapon", "combobox", "Misc", CON, "noscope_hitchance", "No scope weapon", "SSG 08", "SCAR-20", "G3SG1", "AWP", "AUG", "SG 553")
+extras.noscope_profiles, extras.noscope_legacy = {}, {}
+for _, weapon in ipairs({{40,"SSG 08","ssg08"},{38,"SCAR-20","scar20"},{11,"G3SG1","g3sg1"},{9,"AWP","awp"},{8,"AUG","aug"},{39,"SG 553","sg553"}}) do
+    local key="noscope_"..weapon[3]
+    local unscoped=extras.add(key, "slider", "Misc", CON, "noscope_hitchance", "No scope Hitchange\n"..key, -1, 100, -1, true, "", 1, {[-1]="Off",[0]="0"})
+    local scoped=extras.add(key.."_scoped", "slider", "Misc", CON, "noscope_hitchance", "Hitchange\n"..key.."_scoped", -1, 100, -1, true, "", 1, {[-1]="Off",[0]="0"})
+    extras.controls[#extras.controls-1].weapon, extras.controls[#extras.controls].weapon = weapon[2], weapon[2]
+    extras.noscope_profiles[weapon[1]]={unscoped=unscoped, scoped=scoped}
+    extras.noscope_legacy["extra_"..key], extras.noscope_legacy["extra_"..key.."_scoped"] = "extra_noscope_value", "extra_scoped_value"
+end
+ui.set(extras.ui.move_hitchance_weapons, {"SSG 08", "SCAR-20", "G3SG1", "AWP", "Desert Eagle", "R8 Revolver"})
+extras.add("autostop", "checkbox", "Misc", CON, nil, "Ünoins_qucy quick stop")
 extras.add("stop_mode", "combobox", "Misc", CON, "autostop", "Brake activation", "Visible target", "On attack")
 extras.add("stop_fov", "slider", "Misc", CON, "autostop", "Brake field of view", 5, 90, 25, true, "°")
 extras.add("stop_speed", "slider", "Misc", CON, "autostop", "Brake target speed", 5, 60, 20, true, "u/s")
-extras.add("duck_fd", "checkbox", "Misc", CON, nil, "Duck Freedom")
+extras.add("duck_fd", "checkbox", "Misc", CON, nil, "\aFFF59DFFFake duck Freedom\r")
 local fast_ladder = ui.new_checkbox(TAB, CON, "Fast ladder")
 local rh_enabled = ui.new_checkbox(TAB, CON, "\aD4B2D8FFResolver\r")
-extras.header("Misc", CON, "ANIMATION / POSE")
-extras.add("anim", "checkbox", "Misc", CON, nil, "Pose Shift")
-extras.add("anim_ground", "combobox", "Misc", CON, "anim", "Ground pose", "Static", "Jitter", "Moonwalk", "Off")
-extras.add("anim_air", "combobox", "Misc", CON, "anim", "Air pose", "Static", "Cycle", "Off")
-extras.add("anim_amount", "slider", "Misc", CON, "anim", "Pose amount", 0, 100, 100, true, "%")
-extras.add("anim_delay", "slider", "Misc", CON, "anim", "Pose interval", 1, 8, 2, true, "t")
-extras.add("anim_land", "checkbox", "Misc", CON, "anim", "Level pitch on landing")
+extras.header("Misc", "Other", "ANIMATION / POSE")
+extras.add("anim", "checkbox", "Misc", "Other", nil, "\aFFF59DFFAnim breaker\r")
+extras.add("anim_ground", "combobox", "Misc", "Other", "anim", "Ground pose", "Static", "Jitter", "Moonwalk", "Off")
+extras.add("anim_air", "combobox", "Misc", "Other", "anim", "Air pose", "Static", "Cycle", "Off")
+extras.add("anim_amount", "slider", "Misc", "Other", "anim", "Pose amount", 0, 100, 100, true, "%")
+extras.add("anim_delay", "slider", "Misc", "Other", "anim", "Pose interval", 1, 8, 2, true, "t")
+extras.add("anim_land", "checkbox", "Misc", "Other", "anim", "Level pitch on landing")
 extras.header("Misc", "Fake lag", "UTILITY / COMMUNICATION")
 extras.add("drop", "checkbox", "Misc", "Fake lag", nil, "Nade Relay")
 extras.add("drop_key", "hotkey", "Misc", "Fake lag", "drop", "Nade Relay key", true)
 extras.add("drop_types", "multiselect", "Misc", "Fake lag", "drop", "Relay grenades", "HE", "Smoke", "Fire", "Flash", "Decoy")
-local clan_tag_sel = ui.new_combobox(TAB, "Fake lag", "Clan tag", "Off", "Half-life.beta", "Ünoins.qucy", "gamesense", "Ideal Yaw")
+local clan_tag_sel = ui.new_combobox(TAB, "Fake lag", "Clan tag", "Off", "Half-life.beta", "Ünoins_qucy", "gamesense", "Ideal Yaw")
 local hitlog_enabled = ui.new_checkbox(TAB, "Fake lag", "Hit log")
 local auto_mute_all = ui.new_checkbox(TAB, "Fake lag", "\aFF8E8EFFAuto mute all players\r")
 extras.header("Misc", "Fake lag", "PERFORMANCE / CONSOLE")
-extras.add("fps", "checkbox", "Misc", "Fake lag", nil, "Frame Tuner")
+extras.add("fps", "checkbox", "Misc", "Fake lag", nil, "FPS+")
 extras.add("fps_groups", "multiselect", "Misc", "Fake lag", "fps", "Reduce effects", "Blood", "Bloom", "Decals", "Shadows", "Ropes", "Debris", "Weapon effects")
-extras.add("console", "checkbox", "Misc", "Fake lag", nil, "Quiet Console")
-extras.add("console_text", "textbox", "Misc", "Fake lag", "console", "Console match")
+extras.add("console", "checkbox", "Misc", "Fake lag", nil, "Clear Console")
 ui.set(extras.ui.drop_types, {"HE", "Smoke", "Fire"})
 ui.set(extras.ui.fps_groups, {"Bloom", "Ropes", "Debris"})
-ui.set(extras.ui.console_text, "gamesense")
 
 function extras.visible(vis_on, misc_on)
     for _, h in ipairs(extras.headers) do ui.set_visible(h.ref, h.page == "Visuals" and vis_on or h.page == "Misc" and misc_on) end
     for _, c in ipairs(extras.controls) do
         local show = c.page == "Visuals" and vis_on or c.page == "Misc" and misc_on
-        ui.set_visible(c.ref, show and (not c.parent or ui.get(extras.ui[c.parent])))
+        ui.set_visible(c.ref, show and (not c.parent or ui.get(extras.ui[c.parent]))
+            and (not c.weapon or ui.get(extras.ui.noscope_weapon)==c.weapon)
+            and (not c.indicator or ui.get(indicator_sel)==c.indicator))
     end
 end
 
@@ -324,9 +370,9 @@ local vm_cb, vm_color = safe_ref("Visuals", "Colored models", "Weapon viewmodel"
 local tp_vm_active, tp_vm_saved_cb, tp_vm_saved_color = false, nil, nil
 
 local function restore_tp_viewmodel()
-    if tp_vm_saved_cb ~= nil and vm_cb then pcall(ui.set, vm_cb, tp_vm_saved_cb) end
+    if tp_vm_saved_cb ~= nil and vm_cb then ui.set(vm_cb, tp_vm_saved_cb) end
     if tp_vm_saved_color and vm_color then
-        pcall(ui.set, vm_color, tp_vm_saved_color[1], tp_vm_saved_color[2], tp_vm_saved_color[3], tp_vm_saved_color[4])
+        ui.set(vm_color, tp_vm_saved_color[1], tp_vm_saved_color[2], tp_vm_saved_color[3], tp_vm_saved_color[4])
     end
     tp_vm_active, tp_vm_saved_cb, tp_vm_saved_color = false, nil, nil
 end
@@ -345,16 +391,13 @@ local function update_tp_viewmodel()
     local active = ui.get(master) and ui.get(hide_vm_tp) and in_thirdperson()
     if active and not tp_vm_active then
         if vm_cb then
-            local ok, value = pcall(ui.get, vm_cb)
-            if ok then tp_vm_saved_cb = value end
-            pcall(ui.set, vm_cb, true)
+            tp_vm_saved_cb = ui.get(vm_cb)
+            ui.set(vm_cb, true)
         end
         if vm_color then
-            local ok, r, g, b, a = pcall(ui.get, vm_color)
-            if ok then
-                tp_vm_saved_color = {r, g, b, a}
-                pcall(ui.set, vm_color, r, g, b, 0)
-            end
+            local r, g, b, a = ui.get(vm_color)
+            tp_vm_saved_color = {r, g, b, a}
+            ui.set(vm_color, r, g, b, 0)
         end
         tp_vm_active = true
     elseif not active and tp_vm_active then
@@ -364,103 +407,185 @@ end
 
 client.set_event_callback("paint", update_tp_viewmodel)
 local hitlog_shots = {}
-local communication_backup = nil
-local auto_muted_players = {}
-local mute_bridge = nil
-
-local function get_mute_bridge()
-    if mute_bridge then return mute_bridge end
-    local ok, bridge = pcall(function()
-        return panorama.loadstring([[
-            return {
-                mute_index: function(entindex) {
-                    var xuid = GameStateAPI.GetPlayerXuidStringFromEntIndex(entindex);
-                    if (!xuid || xuid === "0") return "";
-                    if (!GameStateAPI.IsSelectedPlayerMuted(xuid)) {
-                        GameStateAPI.ToggleMute(xuid);
-                        return xuid;
-                    }
-                    return "";
-                },
-                unmute_xuid: function(xuid) {
-                    if (!xuid || xuid === "0") return true;
-                    if (GameStateAPI.IsSelectedPlayerMuted(xuid)) {
-                        GameStateAPI.ToggleMute(xuid);
-                    }
-                    return true;
-                }
-            };
-        ]], "CSGOHud")()
-    end)
-    if ok and bridge then mute_bridge = bridge end
-    return mute_bridge
+local communication = {key="unoins.pro.communication.v1", cvars={}, players={}, loaded=false, recovering=true}
+function communication.read(name)
+    local ok,value=checked_call("communication.read", function() return cvar[name]:get_string() end)
+    return ok and value~=nil and tostring(value) or nil
 end
-
-local function mute_panorama_players()
-    local bridge = get_mute_bridge()
-    if not bridge then return end
-    local me = entity.get_local_player()
-    for idx = 1, 64 do
-        if idx ~= me then
-            local ok, xuid = pcall(function() return bridge.mute_index(idx) end)
-            if ok and type(xuid) == "string" and xuid ~= "" and xuid ~= "0" then
-                auto_muted_players[xuid] = true
+function communication.write(name,value)
+    local ok=checked_call("communication.write", function() cvar[name]:set_string(value) end)
+    return ok and communication.read(name)==value
+end
+function communication.warn(reason)
+    if communication.warned == reason then return end
+    communication.warned = reason
+    client.error_log("[Ünoins_qucy] Communication: " .. reason)
+end
+function communication.save()
+    local ok=checked_call("communication.save", database.write,communication.key,{version=1,cvars=communication.cvars,players=communication.players})
+    if not ok then communication.warn("backup save failed; new mute writes blocked") end
+    return ok
+end
+function communication.load()
+    if communication.loaded then return true end
+    local ok,saved=checked_call("communication.load", database.read,communication.key)
+    if not ok then communication.warn("backup read failed; auto mute blocked"); return false end
+    if type(saved)=="table" and saved.version==1 then
+        for _,name in ipairs({"cl_chatfilters","voice_enable"}) do
+            local value=type(saved.cvars)=="table" and saved.cvars[name]
+            if type(value)=="string" and value:match("^%d+$") then communication.cvars[name]=value end
+        end
+        if type(saved.players)=="table" then
+            for xuid,owned in pairs(saved.players) do
+                if owned==true and type(xuid)=="string" and xuid:match("^%d+$") and xuid~="0" then
+                    communication.players[xuid]=true
+                end
             end
         end
     end
+    communication.loaded=true
+    return true
 end
-
-local function restore_panorama_players()
-    local bridge = get_mute_bridge()
-    if not bridge then return end
-    local remaining = {}
-    for xuid in pairs(auto_muted_players) do
-        local ok = pcall(function() bridge.unmute_xuid(xuid) end)
-        if not ok then remaining[xuid] = true end
+function communication.bridge()
+    communication.ready=false
+    local me=entity.get_local_player()
+    if not me or me<1 then communication.panorama=nil; return end
+    if not communication.panorama then
+        local ok,bridge=checked_call("communication.bridge", function()
+            return panorama.loadstring([[
+                return {
+                    ready: function(me) {
+                        if (!me || me < 1 || me > 64) return false;
+                        var xuid = GameStateAPI.GetPlayerXuidStringFromEntIndex(me);
+                        return !!xuid && xuid !== "0";
+                    },
+                    collect: function(me) {
+                        var result = [];
+                        for (var i = 1; i <= 64; i++) {
+                            if (i === me) continue;
+                            var xuid = GameStateAPI.GetPlayerXuidStringFromEntIndex(i);
+                            if (xuid && xuid !== "0" && !GameStateAPI.IsSelectedPlayerMuted(xuid)) result.push(xuid);
+                        }
+                        return result.join(",");
+                    },
+                    set_muted: function(xuid, muted) {
+                        if (GameStateAPI.IsSelectedPlayerMuted(xuid) !== muted) GameStateAPI.ToggleMute(xuid);
+                        return GameStateAPI.IsSelectedPlayerMuted(xuid) === muted;
+                    }
+                };
+            ]],"CSGOHud")()
+        end)
+        if ok then communication.panorama=bridge end
     end
-    auto_muted_players = remaining
+    if not communication.panorama then return end
+    local ok,ready=checked_call("communication.ready", function() return communication.panorama.ready(me) end)
+    communication.ready=ok and ready==true
+    if not ok then communication.panorama=nil end
+    return communication.ready and communication.panorama or nil
 end
-
-local function block_communication()
-    if not communication_backup then
-        communication_backup = {
-            chat = tostring(client.get_cvar("cl_chatfilters") or 63),
-            voice = tostring(client.get_cvar("voice_enable") or 1)
-        }
-    end
-    client.exec("cl_chatfilters 0")
-    client.exec("voice_enable 0")
-    mute_panorama_players()
-end
-
 local function restore_communication()
-    if communication_backup then
-        client.exec("cl_chatfilters " .. communication_backup.chat)
-        client.exec("voice_enable " .. communication_backup.voice)
-        communication_backup = nil
+    if not communication.load() then return end
+    local changed, pending = false, {}
+    for name,value in pairs(communication.cvars) do
+        local current=communication.read(name)
+        if current and (current~="0" or communication.write(name,value)) then
+            communication.cvars[name]=nil
+            changed=true
+        else pending[#pending+1] = name .. " expected=" .. value .. " read=" .. tostring(current) end
     end
-    restore_panorama_players()
+    if next(communication.players) then
+        local bridge=communication.bridge()
+        if bridge then
+            for xuid in pairs(communication.players) do
+                local ok,restored=checked_call("restore_communication", function() return bridge.set_muted(xuid,false) end)
+                if ok and restored==true then communication.players[xuid]=nil; changed=true
+                elseif not ok then communication.panorama=nil end
+            end
+        end
+    end
+    if changed then communication.unsaved=true end
+    if communication.unsaved and communication.save() then communication.unsaved=nil end
+    communication.recovering=next(communication.cvars)~=nil or next(communication.players)~=nil or communication.unsaved==true
+    if communication.recovering then
+        local players = 0
+        for _ in pairs(communication.players) do players = players + 1 end
+        if players > 0 and communication.ready then pending[#pending+1] = "player unmutes unconfirmed=" .. players end
+        if communication.unsaved then pending[#pending+1] = "backup save pending" end
+        table.sort(pending)
+        if #pending>0 then communication.warn("restore pending: " .. table.concat(pending, "; ") .. "; recovery records retained")
+        else communication.warned=nil end
+    else communication.warned=nil end
 end
-
-local function sync_communication_state()
-    if ui.get(master) and ui.get(auto_mute_all) then
-        block_communication()
-    else
+local function block_communication()
+    if not communication.load() then return end
+    if communication.recovering then
         restore_communication()
+        if communication.recovering then return end
+    end
+    local bridge=communication.bridge()
+    if not bridge then return end
+    local values={}
+    for _,name in ipairs({"cl_chatfilters","voice_enable"}) do
+        local value=communication.read(name)
+        if not value or not value:match("^%d+$") then
+            communication.warn("auto mute blocked: unreadable numeric " .. name .. " (" .. tostring(value) .. ")")
+            return
+        end
+        values[name]=value
+    end
+    local dirty=false
+    for name,value in pairs(values) do
+        if communication.cvars[name]==nil or value~="0" and communication.cvars[name]~=value then
+            communication.cvars[name]=value
+            dirty=true
+        end
+    end
+    if bridge then
+        local ok,players=checked_call("block_communication", function() return bridge.collect(entity.get_local_player() or 0) end)
+        if ok and type(players)=="string" then
+            for xuid in players:gmatch("%d+") do
+                if xuid~="0" and not communication.players[xuid] then communication.players[xuid]=true; dirty=true end
+            end
+        elseif not ok then communication.panorama=nil end
+    end
+    if dirty then communication.unsaved=true end
+    if communication.unsaved then
+        if not communication.save() then return end
+        communication.unsaved=nil
+    end
+    for name,value in pairs(values) do
+        if value~="0" and not communication.write(name,"0") then
+            communication.warn("auto mute write unconfirmed: " .. name .. " expected=0 read=" .. tostring(communication.read(name)))
+        end
+    end
+    if bridge then
+        for xuid in pairs(communication.players) do
+            local ok,muted=checked_call("block_communication", function() return bridge.set_muted(xuid,true) end)
+            if not ok or muted~=true then communication.warn("auto mute player state unconfirmed; retry pending") end
+            if not ok then communication.panorama=nil end
+        end
     end
 end
-
-client.set_event_callback("round_start", function()
-    if ui.get(master) and ui.get(auto_mute_all) then block_communication() end
+local function sync_communication_state()
+    if extras.config_loading then return end
+    if ui.get(master) and ui.get(auto_mute_all) then block_communication() else restore_communication() end
+end
+client.set_event_callback("shutdown",restore_communication)
+client.set_event_callback("round_start",sync_communication_state)
+client.set_event_callback("post_config_load",sync_communication_state)
+client.set_event_callback("post_config_load",function() native_snapshot = nil end)
+client.set_event_callback("paint_ui",function()
+    local now=globals.realtime()
+    if not communication.time or now<communication.time or now-communication.time>=0.5 then
+        communication.time=now
+        sync_communication_state()
+    end
 end)
-
-client.set_event_callback("post_config_load", function()
-    sync_communication_state()
-end)
+restore_communication()
 
 local function hl_R(t, c, n)
-    local o, r1, r2, r3 = pcall(ui.reference, t, c, n)
-    if o and r1 then return { r1, r2, r3 } end
+    local r1, r2, r3 = safe_ref(t, c, n)
+    if r1 then return { r1, r2, r3 } end
 end
 
 local function hl_F(...)
@@ -474,16 +599,14 @@ hl_ref.os = hl_F("AA", "Other", "On shot anti-aim", "AA", "Anti-aimbot angles", 
 hl_ref.mindmg = hl_F("RAGE", "Aimbot", "Minimum damage", "RAGE", "Other", "Minimum damage")
 
 local function hl_active(r)
-    if not r then return false end
-    if r[2] then
-        local ok1, v1 = pcall(ui.get, r[1])
-        local ok2, v2 = pcall(ui.get, r[2])
-        if ok1 and ok2 then return (v1 == true) and (v2 == true) end
-        if ok1 then return v1 == true end
-    end
-    local ok, v = pcall(ui.get, r[1])
-    return ok and (v == true)
+    if not r or not r[1] then return false end
+    local ok, enabled = checked_call("hl_active", ui.get, r[1])
+    if not ok or enabled ~= true then return false end
+    if not r[2] then return true end
+    local key_ok, active = checked_call("hl_active", ui.get, r[2])
+    return key_ok and active == true
 end
+
 local cfg = {}
 for _, cond in ipairs(conditions) do
     cfg[cond] = {
@@ -562,6 +685,7 @@ reg_item("safe_head_weapons", safe_head_weapons)
 reg_item("freestanding_states", fs_states)
 reg_item("freestanding_options", fs_options)
 reg_item("anti_backstab", anti_backstab)
+reg_item("fl_ground_mode", fl_ground_mode)
 reg_item("hide_vm_tp", hide_vm_tp)
 reg_item("indicator_sel", indicator_sel)
 reg_item("ind_groupname", ind_groupname)
@@ -633,60 +757,166 @@ for _, cond in ipairs(conditions) do
     reg_item(cond .. "_fakelag", c.fakelag)
 end
 local b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local b64_bytes, b64_values = {}, {}
+for i = 1, #b64_chars do
+    local byte = b64_chars:byte(i)
+    b64_bytes[i-1], b64_values[byte] = byte, i-1
+end
 
 local function b64_encode(data)
-    return ((data:gsub(".", function(x)
-        local r, b = "", x:byte()
-        for i = 8, 1, -1 do r = r .. (b % 2^i - b % 2^(i-1) > 0 and "1" or "0") end
-        return r
-    end) .. "0000"):gsub("%d%d%d?%d?%d?%d?", function(x)
-        if (#x < 6) then return "" end
-        local c = 0
-        for i = 1, 6 do c = c + (x:sub(i, i) == "1" and 2^(6-i) or 0) end
-        return b64_chars:sub(c + 1, c + 1)
-    end) .. ({ "", "==", "=" })[#data % 3 + 1])
+    local result = {}
+    for i = 1, #data, 3 do
+        local a, b, c = data:byte(i, i+2)
+        local word = bit.lshift(a, 16) + bit.lshift(b or 0, 8) + (c or 0)
+        result[#result+1] = string.char(
+            b64_bytes[bit.rshift(word, 18)], b64_bytes[bit.band(bit.rshift(word, 12), 63)],
+            b and b64_bytes[bit.band(bit.rshift(word, 6), 63)] or 61,
+            c and b64_bytes[bit.band(word, 63)] or 61)
+    end
+    return table.concat(result)
 end
 
 local function b64_decode(data)
-    data = string.gsub(data, "[^" .. b64_chars .. "=]", "")
-    return (data:gsub(".", function(x)
-        if (x == "=") then return "" end
-        local r, f = "", (b64_chars:find(x) - 1)
-        for i = 6, 1, -1 do r = r .. (f % 2^i - f % 2^(i-1) > 0 and "1" or "0") end
-        return r
-    end):gsub("%d%d%d?%d?%d?%d?%d?%d?", function(x)
-        if (#x ~= 8) then return "" end
-        local c = 0
-        for i = 1, 8 do c = c + (x:sub(i, i) == "1" and 2^(8-i) or 0) end
-        return string.char(c)
-    end))
+    local result, buffer, bits = {}, 0, 0
+    for i = 1, #data do
+        local value = b64_values[data:byte(i)]
+        if value then
+            buffer, bits = bit.lshift(buffer, 6) + value, bits + 6
+            if bits >= 8 then
+                bits = bits - 8
+                result[#result+1] = string.char(bit.band(bit.rshift(buffer, bits), 255))
+                buffer = bit.band(buffer, bit.lshift(1, bits)-1)
+            end
+        end
+    end
+    return table.concat(result)
+end
+
+local function xor_bytes(data)
+    local result = {}
+    for i = 1, #data do result[i] = string.char(bit.bxor(data:byte(i), 0x5D)) end
+    return table.concat(result)
+end
+
+local config_codec = {limit=1048576, prefix="Ünoins_qucy~"}
+
+function config_codec.u32(value)
+    return string.char(bit.band(value,255),bit.band(bit.rshift(value,8),255),
+        bit.band(bit.rshift(value,16),255),bit.rshift(value,24))
+end
+
+function config_codec.read_u32(data, offset)
+    local a,b,c,d=data:byte(offset,offset+3)
+    return a+b*256+c*65536+d*16777216
+end
+
+function config_codec.checksum(data)
+    local a,b=1,0
+    for i=1,#data do a=(a+data:byte(i))%65521; b=(b+a)%65521 end
+    return b*65536+a
+end
+
+function config_codec.compress(data)
+    local output,heads,previous={}, {}, {}
+    local size,pos,literal,work=#data,1,1,0
+    local function insert(index)
+        if index+2>size then return end
+        local key=data:sub(index,index+2)
+        previous[index],heads[key]=heads[key],index
+    end
+    local function flush(finish)
+        while literal<=finish do
+            local count=math.min(128,finish-literal+1)
+            output[#output+1]=string.char(count-1)..data:sub(literal,literal+count-1)
+            literal=literal+count
+        end
+    end
+    while pos<=size do
+        local candidate=pos+2<=size and heads[data:sub(pos,pos+2)]
+        local length,distance,tries=0,0,0
+        local maximum=math.min(130,size-pos+1)
+        while candidate and pos-candidate<=65535 and tries<32 do
+            local matched=3
+            while matched<maximum and data:byte(candidate+matched)==data:byte(pos+matched) do
+                matched,work=matched+1,work+1
+                if work>size*32 then return nil end
+            end
+            if matched>length then length,distance=matched,pos-candidate end
+            if length==maximum then break end
+            candidate,tries=previous[candidate],tries+1
+        end
+        if length>=4 then
+            flush(pos-1)
+            output[#output+1]=string.char(128+length-3,bit.band(distance,255),bit.rshift(distance,8))
+            for i=pos,pos+length-1 do insert(i) end
+            pos=pos+length; literal=pos
+        else
+            insert(pos); pos=pos+1
+            if pos-literal==128 then flush(pos-1) end
+        end
+    end
+    flush(size)
+    return table.concat(output)
+end
+
+function config_codec.decompress(data, size)
+    local output,pos,count={},1,0
+    while pos<=#data do
+        local control=data:byte(pos); pos=pos+1
+        if control<128 then
+            local length=control+1
+            if pos+length-1>#data or count+length>size then return nil end
+            for i=pos,pos+length-1 do count=count+1; output[count]=data:sub(i,i) end
+            pos=pos+length
+        else
+            if pos+1>#data then return nil end
+            local length=control-128+3
+            local distance=data:byte(pos)+data:byte(pos+1)*256
+            if distance<1 or distance>count or count+length>size then return nil end
+            for _=1,length do count=count+1; output[count]=output[count-distance] end
+            pos=pos+2
+        end
+    end
+    if count~=size then return nil end
+    return table.concat(output)
 end
 
 local function obfuscate(str)
-    local key = 0x5D
-    local bytes = {}
-    for i = 1, #str do
-        bytes[#bytes + 1] = string.char(bit.bxor(str:byte(i), key))
-    end
-    return "UNOINS~" .. b64_encode(table.concat(bytes))
+    assert(type(str)=="string" and #str<=config_codec.limit,"config: serialized data exceeds 1 MiB or is invalid")
+    local packed=#str>=32 and config_codec.compress(str)
+    local compressed=packed and #packed<#str
+    local size=#str+(compressed and 0 or 2147483648)
+    return config_codec.prefix..b64_encode(config_codec.u32(size)..config_codec.u32(config_codec.checksum(str))..(compressed and packed or str))
 end
 
 local function deobfuscate(str)
-    if str:sub(1, 7) ~= "UNOINS~" then return nil end
-    str = str:sub(8)
-    local raw = b64_decode(str)
-    if not raw or raw == "" then return nil end
-    local key = 0x5D
-    local bytes = {}
-    for i = 1, #raw do
-        bytes[#bytes + 1] = string.char(bit.bxor(raw:byte(i), key))
+    if type(str)~="string" or #str>config_codec.limit*2 then return nil,"invalid or oversized config" end
+    local branded=str:sub(1,#config_codec.prefix)==config_codec.prefix
+    if branded or str:sub(1,8)=="UNOINS2~" then
+        local encoded=str:sub((branded and #config_codec.prefix or 8)+1):gsub("%s","")
+        if #encoded%4~=0 or encoded:find("[^A-Za-z0-9+/=]") then return nil,"invalid Base64" end
+        local raw=b64_decode(encoded)
+        if #raw<8 or b64_encode(raw)~=encoded then return nil,"invalid Base64 or header" end
+        local size=config_codec.read_u32(raw,1)
+        local plain=branded and size>=2147483648
+        if plain then size=size-2147483648 end
+        if size>config_codec.limit or size==0 and not plain then return nil,"invalid decompressed size" end
+        local data
+        if plain then data=raw:sub(9) else data=config_codec.decompress(raw:sub(9),size) end
+        if not data or #data~=size then return nil,"invalid compressed data" end
+        if config_codec.checksum(data)~=config_codec.read_u32(raw,5) then return nil,"config checksum mismatch" end
+        if data=="" then return nil,"empty config" end
+        return data
     end
-    return table.concat(bytes)
+    if str:match("^UNOINS%d+~") then return nil,"unsupported config version" end
+    if str:sub(1,7)~="UNOINS~" then return nil end
+    local raw=b64_decode(str:sub(8))
+    return raw~="" and xor_bytes(raw) or nil
 end
 
 local function serialize_data(tbl)
     if json_ok and json and json.stringify then
-        local ok, str = pcall(json.stringify, tbl)
+        local ok, str = checked_call("serialize_data", json.stringify, tbl)
         if ok and str then return str end
     end
     local function escape(value)
@@ -714,7 +944,7 @@ end
 local function deserialize_data(str)
     if not str or str == "" then return nil end
     if json_ok and json and json.parse and (str:sub(1,1) == "{" or str:sub(1,1) == "[") then
-        local ok, tbl = pcall(json.parse, str)
+        local ok, tbl = checked_call("deserialize_data", json.parse, str)
         if ok and type(tbl) == "table" then return tbl end
     end
     if str:sub(1,6) == "UCFG2\n" then
@@ -765,7 +995,7 @@ local function deserialize_data(str)
             end
         end
     end
-    return tbl
+    return next(tbl) and tbl or nil
 end
 
 local function dump_config_table()
@@ -783,45 +1013,67 @@ local function dump_config_table()
 end
 local master_cleanup
 
-local function migrate_unoins_label(value)
-    if type(value) == "string" then return value:gsub("Unoins", "Ünoins") end
-    if type(value) == "table" then
-        local copy = {}
-        for i = 1, #value do copy[i] = migrate_unoins_label(value[i]) end
-        return copy
-    end
-    return value
-end
+local legacy_labels = {
+    indicator_sel = {["Unoins"]="Ünoins_qucy", ["Ünoins"]="Ünoins_qucy", ["Unoins.qucy new"]="Ünoins_qucy new"},
+    clan_tag_sel = {["Unoins.qucy"]="Ünoins_qucy", ["Ünoins.qucy"]="Ünoins_qucy"}
+}
 
 local function load_config_table(data)
-    if type(data) ~= "table" then return end
+    local result = {matched=0, applied=0, failed=0}
+    if type(data) ~= "table" then return result end
+    extras.config_loading = true
     for _, item in ipairs(all_config_items) do
         local val = data[item.key]
+        if val == nil and extras.noscope_legacy[item.key] then val = data[extras.noscope_legacy[item.key]] end
         if val == nil then
             local legacy_key = item.key:gsub("^Freestanding_", "Freestand_")
             if legacy_key ~= item.key then val = data[legacy_key] end
         end
         if val ~= nil and item.ref then
-            if not item.kind then val = migrate_unoins_label(val) end
+            result.matched = result.matched + 1
+            if legacy_labels[item.key] then val = legacy_labels[item.key][val] or val end
             if item.key == "defensive_backend" and type(val) == "string" then
-                if val:find("Ünoins Pro", 1, true) then val = "\aFF9C9CFFÜnoins Pro\r"
-                elseif val:find("Ünoins", 1, true) then val = "\aFFF59DFFÜnoins\r"
+                if val:find("noins.-Pro") then val = "\aFF9C9CFFÜnoins_qucy Pro\r"
+                elseif val:find("noins") then val = "\aFFF59DFFÜnoins_qucy\r"
                 elseif val:find("Gamesense", 1, true) then val = "\a87B313FFGamesense\r" end
             end
             if item.kind == "hotkey" and type(val) == "table" then
                 local modes = {"Always on", "On hotkey", "Toggle", "Off hotkey"}
                 local mode = modes[(tonumber(val[1]) or 1) + 1]
-                if mode then pcall(ui.set, item.ref, mode, tonumber(val[2]) or 0) end
-            elseif type(val) == "table" then
-                pcall(ui.set, item.ref, unpack(val))
+                val = mode and {mode, tonumber(val[2]) or 0} or nil
+            end
+            if val ~= nil then
+                local spread = type(val) == "table" and (item.kind == "color_picker" or item.kind == "hotkey")
+                local ok = checked_call("config field " .. item.key, function()
+                    if spread then ui.set(item.ref, unpack(val)) else ui.set(item.ref, val) end
+                end)
+                if ok then result.applied=result.applied+1 else result.failed=result.failed+1 end
             else
-                pcall(ui.set, item.ref, val)
+                result.failed=result.failed+1
+                client.error_log("[Ünoins_qucy] Invalid config field: " .. item.key)
             end
         end
     end
-    invalidate_freestand_controller()
-    sync_communication_state()
-    if update_vis then update_vis() end
+    extras.config_loading = nil
+    if result.matched > 0 then
+        invalidate_freestand_controller()
+        sync_communication_state()
+        extras.sync()
+        if extras.scope_control then extras.scope_control() end
+        if update_vis then update_vis() end
+    end
+    return result
+end
+
+local function report_config_load(data, action)
+    local result = load_config_table(data)
+    if result.matched == 0 then
+        client.log("config " .. action .. " failed: no recognized settings")
+    elseif result.failed > 0 then
+        client.log(string.format("config %s partial: %d applied, %d failed; see errors above", action, result.applied, result.failed))
+    else
+        client.log(action == "import" and "config imported" or "config loaded")
+    end
 end
 
 local function refresh_config_listbox()
@@ -854,7 +1106,7 @@ ui.set_callback(cfg_save_btn, function()
     local data = dump_config_table()
     local serialized = serialize_data(data)
     local obfuscated = obfuscate(serialized)
-    pcall(database.write, "unoins_cfg_" .. name, obfuscated)
+    database.write("unoins_cfg_" .. name, obfuscated)
     refresh_config_listbox()
     client.log("config saved")
 end)
@@ -862,13 +1114,15 @@ ui.set_callback(cfg_load_btn, function()
     local sel_idx = ui.get(cfg_listbox) or 0
     local name = active_config_names[sel_idx + 1]
     if not name or name == "-" then return end
-    local ok, raw = pcall(database.read, "unoins_cfg_" .. name)
-    if ok and raw then
-        local deob = deobfuscate(raw) or raw
-        local data = deserialize_data(deob)
+    local raw = database.read("unoins_cfg_" .. name)
+    if raw then
+        local deob, err = deobfuscate(raw)
+        if err then client.log("config load failed: " .. err); return end
+        local data = deserialize_data(deob or raw)
         if data then
-            load_config_table(data)
-            client.log("config loaded")
+            report_config_load(data, "load")
+        else
+            client.log("config load failed: invalid data")
         end
     end
 end)
@@ -883,7 +1137,7 @@ ui.set_callback(cfg_delete_btn, function()
     if #new_list == 0 then new_list = { "default" } end
     active_config_names = new_list
     save_config_names_list(active_config_names)
-    pcall(database.write, "unoins_cfg_" .. name, nil)
+    database.write("unoins_cfg_" .. name, nil)
     refresh_config_listbox()
     client.log("config deleted")
 end)
@@ -891,17 +1145,19 @@ ui.set_callback(cfg_export_btn, function()
     local data = dump_config_table()
     local serialized = serialize_data(data)
     local obfuscated = obfuscate(serialized)
-    pcall(clipboard.set, obfuscated)
+    local ok, result = checked_call("config export", clipboard.set, obfuscated)
+    if not ok or result == false then client.log("config export failed: clipboard unavailable"); return end
     client.log("config exported")
 end)
 ui.set_callback(cfg_import_btn, function()
-    local ok, raw = pcall(clipboard.get)
-    if ok and raw and raw ~= "" then
-        local deob = deobfuscate(raw) or raw
-        local data = deserialize_data(deob)
+    local ok, raw = checked_call("config import", clipboard.get)
+    if not ok then client.log("config import failed: clipboard unavailable"); return end
+    if raw and raw ~= "" then
+        local deob, err = deobfuscate(raw)
+        if err then client.log("config import failed: " .. err); return end
+        local data = deserialize_data(deob or raw)
         if data then
-            load_config_table(data)
-            client.log("config imported")
+            report_config_load(data, "import")
         else
             client.log("config import failed")
         end
@@ -924,7 +1180,7 @@ end
 update_vis = function()
     local master_on = ui.get(master)
     local page = tostring(ui.get(page_sel) or "")
-    if master_on then hide_native() else show_native() end
+    if master_on then native_visible(false) else native_visible(true) end
     local function match_page(target)
         return page == target or string.find(page, target, 1, true) ~= nil
     end
@@ -941,7 +1197,7 @@ update_vis = function()
     ui.set_visible(cfg_import_btn, home_on)
     ui.set_visible(cfg_export_btn, home_on)
     ui.set_visible(defensive_backend, aa_on)
-    local pro_visible = aa_on and tostring(ui.get(defensive_backend)):find("Ünoins Pro", 1, true) ~= nil
+    local pro_visible = aa_on and tostring(ui.get(defensive_backend)):find("Ünoins_qucy Pro", 1, true) ~= nil
     ui.set_visible(safe_head_weapons, aa_on)
     ui.set_visible(manual_left, aa_on)
     ui.set_visible(manual_right, aa_on)
@@ -951,10 +1207,12 @@ update_vis = function()
     ui.set_visible(fs_options, aa_on)
     ui.set_visible(edge_hotkey, aa_on)
     ui.set_visible(anti_backstab, aa_on)
+    ui.set_visible(fl_ground_mode, aa_on)
     ui.set_visible(condition_sel, aa_on)
     ui.set_visible(hide_vm_tp, vis_on)
-    local show_unoins = vis_on and has_trigger(indicator_sel, "Ünoins")
+    local show_unoins = vis_on and has_trigger(indicator_sel, "Ünoins_qucy")
     ui.set_visible(indicator_sel, vis_on)
+    ui.set_visible(qucy_color, vis_on and ui.get(indicator_sel) == "Ünoins_qucy new")
     ui.set_visible(ind_groupname, show_unoins)
     ui.set_visible(dmg_indicator, vis_on)
     ui.set_visible(clan_tag_sel, misc_on)
@@ -1043,8 +1301,8 @@ end
 ui.set_callback(page_sel, update_vis)
 ui.set_callback(master, function()
     sync_communication_state()
-    if not ui.get(master) then hitlog_shots = {} end
     if not ui.get(master) then
+        hitlog_shots = {}
         extras.cleanup()
         reset_native()
         invalidate_freestand_controller()
@@ -1072,28 +1330,16 @@ ui.set_callback(auto_mute_all, function()
 end)
 for _, cond in ipairs(conditions) do
     local c = cfg[cond]
-    if c.enabled then ui.set_callback(c.enabled, update_vis) end
-    ui.set_callback(c.yaw_left_right, update_vis)
-    ui.set_callback(c.slow_pro_mode, update_vis)
-    ui.set_callback(c.yaw_jitter,update_vis); ui.set_callback(c.body_yaw, update_vis)
-    ui.set_callback(c.force_def, update_vis); ui.set_callback(c.force_break, update_vis)
-    ui.set_callback(c.height_based_pitch, update_vis)
-    ui.set_callback(c.fakelag, update_vis)
-    ui.set_callback(c.def_mode, update_vis); ui.set_callback(c.def_trigger, update_vis); ui.set_callback(c.def_duration, update_vis)
-    ui.set_callback(c.def_pitch, update_vis); ui.set_callback(c.def_pitch_jdelay, update_vis)
-    ui.set_callback(c.def_yaw, update_vis); ui.set_callback(c.def_yaw_val, update_vis)
-    ui.set_callback(c.def_yaw_jdelay, update_vis); ui.set_callback(c.def_yaw_r1, update_vis); ui.set_callback(c.def_yaw_r2, update_vis)
-    ui.set_callback(c.def_yaw_way_count, update_vis)
-    ui.set_callback(c.def_body_yaw, update_vis)
-    for i = 1, 10 do
-        ui.set_callback(c.def_yaw_ways[i], update_vis)
+    for _, ref in ipairs({c.yaw_left_right, c.yaw_jitter, c.slow_pro_mode, c.body_yaw, c.force_def,
+        c.def_pitch, c.def_yaw, c.def_yaw_way_count, c.def_body_yaw}) do
+        ui.set_callback(ref, update_vis)
     end
 end
 update_vis()
 
 client.set_event_callback("paint_ui", function()
     if ui.is_menu_open() then
-        if ui.get(master) then hide_native() else show_native() end
+        if ui.get(master) then native_visible(false) else native_visible(true) end
     end
 end)
 
@@ -1371,12 +1617,12 @@ local function is_early_peek(me)
     if move_x * move_x + move_y * move_y < 144 then return false end
     local function bullet_exposed(shooter, sx, sy, sz, tx, ty, tz)
         if type(client.trace_bullet) ~= "function" then return false end
-        local ok, _, damage = pcall(client.trace_bullet, shooter, sx, sy, sz, tx, ty, tz)
+        local ok, _, damage = checked_call("bullet_exposed", client.trace_bullet, shooter, sx, sy, sz, tx, ty, tz)
         return ok and (tonumber(damage) or 0) > 0
     end
     local function line_exposed(skip, sx, sy, sz, tx, ty, tz, target)
         if type(client.trace_line) ~= "function" then return false end
-        local ok, fraction, hit = pcall(client.trace_line, skip, sx, sy, sz, tx, ty, tz)
+        local ok, fraction, hit = checked_call("line_exposed", client.trace_line, skip, sx, sy, sz, tx, ty, tz)
         return ok and (hit == target or (fraction and fraction > 0.97))
     end
     local enemies = entity.get_players(true)
@@ -1429,7 +1675,7 @@ local function find_backstab_threat(me)
                 if dx * dx + dy * dy + dz * dz <= max_distance_sqr then
                     local hx, hy, hz = entity.hitbox_position(enemy, 4)
                     if hx then
-                        local ok, fraction, hit = pcall(
+                        local ok, fraction, hit = checked_call("find_backstab_threat", 
                             client.trace_line, enemy, hx, hy, hz, eye_x, eye_y, eye_z
                         )
                         if ok and (hit == me or (fraction and fraction > 0.97)) then
@@ -1462,6 +1708,55 @@ client.set_event_callback("player_death", reset_local_defensive)
 local SLOW_RATE = 3
 local hl_dt_st, hl_dt_lc, hl_dt_wh = "off", 0, false
 local last_fl = { on = false, mode = "", limit = 0 }
+ui.set_callback(fl_ground_mode, function() last_fl.on = nil end)
+local fl_peek_until = -1
+
+local function fl_user_value(key)
+    local saved = native_snapshot and native_snapshot[key]
+    return saved and saved[1]
+end
+
+local function fl_can_shoot_visible(me)
+    local weapon = entity.get_player_weapon(me)
+    if not weapon then return false end
+    local tickbase, interval = entity.get_prop(me, "m_nTickBase"), globals.tickinterval()
+    if not pro.finite(tickbase) or not pro.finite(interval) or interval <= 0 then return false end
+    local now = tickbase * interval
+    local ready = math.max(entity.get_prop(me, "m_flNextAttack") or 0, entity.get_prop(weapon, "m_flNextPrimaryAttack") or 0)
+    if ready > now then return false end
+    if (entity.get_prop(weapon, "m_iClip1") or 0) <= 0 then return false end
+    local threat = client.current_threat()
+    if not threat or not entity.is_alive(threat) or entity.is_dormant(threat) then return false end
+    local x, y, z = entity.hitbox_position(threat, 0)
+    return x ~= nil and client.visible(x, y, z)
+end
+
+local function fakelag_plan(me)
+    if hl_active(hl_ref.dt) then return true end
+    local interval = globals.tickinterval()
+    local cap = math.max(2, math.min(14, max_proc - 1))
+    local vx = entity.get_prop(me, "m_vecVelocity[0]") or 0
+    local vy = entity.get_prop(me, "m_vecVelocity[1]") or 0
+    local speed = math.sqrt(vx * vx + vy * vy)
+    local on_ground = bit.band(entity.get_prop(me, "m_fFlags") or 0, 1) ~= 0
+    local tick = globals.tickcount()
+    if on_ground and speed <= 10 then return false end
+    local need = (pro.finite(interval) and interval > 0 and speed > 1) and math.ceil(64 / (speed * interval)) or math.huge
+    if on_ground and fl_can_shoot_visible(me) then
+        fl_peek_until = -1
+        return true, "Maximum", 2, 0
+    end
+    if on_ground and speed > 25 then
+        local ok, ctx = checked_call("fakelag peek", pro.probe, me, true)
+        if ok and ctx and ctx.peek then fl_peek_until = tick + 8 end
+    end
+    if tick <= fl_peek_until then return true, "Maximum", cap, 0 end
+    if need <= cap then return true, "Dynamic", math.min(cap, need + 1), 0 end
+    if not on_ground then return true, "Dynamic", cap, 0 end
+    local variance = math.floor(math.max(0, math.min(100, speed / 300 * 100)))
+    if ui.get(fl_ground_mode) == "Maximum" then return true, "Maximum", cap, variance end
+    return true, "Maximum", 3, 0
+end
 
 local function get_threat_height_diff(me)
     if not me or not entity.is_alive(me) then return 0 end
@@ -1790,36 +2085,25 @@ local function apply_condition(cond, move_cond, cmd)
     local edge_active_for_condition = cond ~= "manual" and edge_active
     nset(N.edge_yaw, edge_active_for_condition)
     if fs_requested then nset(N.edge_yaw, false) end
-    local fl_c = resolve_config(cond, move_cond)
-    local fl_mode = tostring(ui.get((cond == "manual" and cfg["Global"] or fl_c).fakelag) or "")
-    local fl_on, fl_limit = false, 0
+    local fl_mode = tostring(ui.get((cond == "manual" and cfg["Global"] or c).fakelag) or "")
+    local fl_on, fl_amount, fl_limit, fl_var = false, nil, nil, nil
     local is_adaptive = string.find(fl_mode, "Adaptive", 1, true) ~= nil
     if fl_mode ~= "Off" and fl_mode ~= "" then
-        local me2 = entity.get_local_player()
         fl_on = true
-        if is_adaptive then
-            local vx = me2 and entity.get_prop(me2, "m_vecVelocity[0]") or 0
-            local vy = me2 and entity.get_prop(me2, "m_vecVelocity[1]") or 0
-            local spd = math.sqrt(vx * vx + vy * vy)
-            local ducking = me2 and entity.get_prop(me2, "m_flDuckAmount") == 1
-            if spd <= 10 and not ducking then
-                fl_on = false
-            elseif spd < 200 or ducking then
-                fl_limit = 7
-            else
-                fl_limit = 14
-            end
-        end
+        local me2 = entity.get_local_player()
+        if is_adaptive and me2 then fl_on, fl_amount, fl_limit, fl_var = fakelag_plan(me2) end
     end
     if extras.onshot() then fl_on = false end
-    if last_fl.on ~= fl_on or last_fl.mode ~= fl_mode or last_fl.limit ~= fl_limit then
-        last_fl.on, last_fl.mode, last_fl.limit = fl_on, fl_mode, fl_limit
+    if not fl_amount then
+        fl_amount, fl_limit, fl_var = fl_user_value("fake_amt"), fl_user_value("fake_limit"), fl_user_value("fake_var")
+    end
+    if last_fl.on ~= fl_on or last_fl.mode ~= fl_mode or last_fl.limit ~= fl_limit
+        or last_fl.amount ~= fl_amount or last_fl.var ~= fl_var then
+        last_fl.on, last_fl.mode, last_fl.limit, last_fl.amount, last_fl.var = fl_on, fl_mode, fl_limit, fl_amount, fl_var
         nset(N.fake_enabled, fl_on)
-        if fl_on and is_adaptive then
-            nset(N.fake_amt, "Dynamic")
-            nset(N.fake_limit, fl_limit)
-            nset(N.fake_var, 4)
-        end
+        if fl_amount ~= nil then nset(N.fake_amt, fl_amount) end
+        if fl_limit ~= nil then nset(N.fake_limit, fl_limit) end
+        if fl_var ~= nil then nset(N.fake_var, fl_var) end
     end
     nset(N.roll, 0)
     return c
@@ -1863,7 +2147,7 @@ local function apply_defensive_body(c, phase)
     nset(N.body_yaw_add, side * 90)
 end
 
-local function update_defensive_window(state, tick, valid, remaining, duration)
+local function update_defensive_window(state, tick, valid, duration)
     if not valid then
         state.window = false
         state.window_until = -1
@@ -1874,9 +2158,7 @@ local function update_defensive_window(state, tick, valid, remaining, duration)
     local entered = not state.window
     if entered then
         state.window = true
-        state.window_until = tick + math.min(duration, remaining)
-    else
-        state.window_until = math.min(state.window_until, tick + remaining)
+        state.window_until = tick + duration
     end
     if tick >= state.window_until then
         state.window = false
@@ -1907,9 +2189,9 @@ local function apply_timed_defensive(backend, c, cmd, me)
     defensive_state.request = should_request
     if should_request then cmd.force_defensive = true end
     suppress_defensive_base(c, should_request)
-    local breaking, remaining = is_breaking_lc()
+    local breaking = is_breaking_lc()
     local duration = math.max(1, math.min(14, ui.get(c.def_duration) or 14))
-    local active, entered = update_defensive_window(state, tick, breaking, remaining, duration)
+    local active, entered = update_defensive_window(state, tick, breaking, duration)
     if not active then return false end
     if entered then
         state.cached_config = nil
@@ -1955,7 +2237,7 @@ local function apply_timed_defensive(backend, c, cmd, me)
     if state.cached_yaw then
         local diff = state.cached_yaw
         if diff >= 180 then diff = 179 elseif diff <= -180 then diff = -179 end
-        nset(N.yaw_base, "Local view")
+        nset(N.yaw_base, ui.get(c.yaw_base))
         nset(N.yaw, "180")
         nset(N.yaw_add, defensive_yaw(diff, not ui.get(c.def_trigger)))
     end
@@ -2002,7 +2284,7 @@ function pro.finite(v)
 end
 
 function pro.selected()
-    return tostring(ui.get(defensive_backend) or ""):find("Ünoins Pro", 1, true) ~= nil
+    return tostring(ui.get(defensive_backend) or ""):find("Ünoins_qucy Pro", 1, true) ~= nil
 end
 
 function pro.capacity(choke)
@@ -2016,7 +2298,7 @@ function pro.reset(reason)
     for key in pairs(s) do s[key] = nil end
     s.seen, s.last_command, s.last_send = -1, -1, -1
     s.deadline, s.window_until, s.peek_until = -1, -1, -1
-    s.request_started, s.retry_at, s.probe_tick = -1, -1, -100
+    s.probe_tick = -100
     s.raw_left, s.phase, s.phase_tick = 0, 0, -1
     s.window, s.episode, s.exhausted = false, false, false
     s.reason = reason or "reset"
@@ -2141,14 +2423,14 @@ function pro.probe(me, need_peek)
         if bit.band(entity.get_prop(me,"m_fFlags") or 0,1) == 0 then
             pz = pz - 400*dt*dt
         end
-        local ok, fraction = pcall(client.trace_line, me,x,y,z,px,py,pz)
+        local ok, fraction = checked_call("pro.probe", client.trace_line, me,x,y,z,px,py,pz)
         if ok and pro.finite(fraction) then
             fraction = math.max(0,math.min(1,fraction)-0.02)
             points[#points+1] = {x+(px-x)*fraction,y+(py-y)*fraction,z+(pz-z)*fraction}
         end
     end
     local function exposed(enemy, sx,sy,sz, tx,ty,tz)
-        local ok, hit, damage = pcall(client.trace_bullet, me,sx,sy,sz,tx,ty,tz)
+        local ok, hit, damage = checked_call("exposed", client.trace_bullet, me,sx,sy,sz,tx,ty,tz)
         return ok and hit == enemy and pro.finite(damage) and damage > 0
     end
     for i=1, math.min(3,#enemies) do
@@ -2170,12 +2452,11 @@ end
 function pro.window(cmd, c)
     local s, tick = pro.state, globals.tickcount()
     local age = tick-s.seen
-    local margin = 2
     local choke = math.max(0, cmd.chokedcommands or 0)
     local remaining = math.min(s.raw_left-math.max(0,age), s.deadline-tick, pro.capacity(choke))
     local valid = s.episode and not s.exhausted and age >= 0 and age <= 2
-    local finish = math.min(s.deadline-margin-choke,
-        (s.started or tick)+ui.get(c.def_duration), tick+remaining-margin-choke)
+    local finish = math.min(s.deadline,
+        (s.started or tick)+ui.get(c.def_duration), tick+remaining)
     if s.window then finish = math.min(finish,s.window_until) end
     if not valid or tick >= finish then
         if s.window or (s.episode and (age > 2 or tick >= finish)) then s.exhausted=true end
@@ -2184,11 +2465,6 @@ function pro.window(cmd, c)
         return false, false, 0
     end
     local entered = not s.window
-    if entered and choke > 0 then
-        if ui.get(c.force_break) then cmd.allow_send_packet=true end
-        s.reason = "send_boundary"
-        return false, false, remaining
-    end
     s.window, s.window_until, s.reason = true, finish, "active"
     if entered then s.cache, s.phase, s.last_send = nil, 0, -1 end
     return true, entered, remaining
@@ -2203,16 +2479,27 @@ function pro.request(c, cmd, me)
         defensive_state.peeking = ctx.peek
     end
     local wanted = mode == "Always" or (mode == "On peek" and tick <= s.peek_until)
-    if not wanted or s.episode then s.request_started=-1; return end
-    if tick < s.retry_at then return end
-    if s.request_started < 0 then s.request_started=tick end
-    if tick-s.request_started >= 8 then
-        s.request_started, s.retry_at = -1, tick+2
-        return
-    end
+    if not wanted or s.episode then return end
     cmd.force_defensive = true
     defensive_state.request = true
     s.reason = "request"
+end
+
+function pro.custom_way_phase(c, cmd)
+    local s = pro.state
+    s.way_sequences = s.way_sequences or {}
+    local count = math.max(1,math.min(10,ui.get(c.def_yaw_way_count) or 1))
+    local sequence = s.way_sequences[c]
+    if not sequence or sequence.count ~= count then
+        sequence = {count=count, phase=0, last_command=-1}
+        s.way_sequences[c] = sequence
+    end
+    local command = cmd.command_number or globals.tickcount()
+    if (cmd.chokedcommands or 0) == 0 and pro.finite(command) and command > sequence.last_command then
+        if sequence.last_command >= 0 then sequence.phase=(sequence.phase+1)%(count*2) end
+        sequence.last_command = command
+    end
+    return sequence.phase
 end
 
 function pro.angles(c, cmd)
@@ -2228,7 +2515,9 @@ function pro.angles(c, cmd)
     if not s.cache or clean and (s.phase_tick ~= phase or s.config_key ~= key) then
         local cache = {}
         cache.pitch_mode, cache.pitch = calc_def_pitch(ui.get(c.def_pitch),c,phase)
-        cache.yaw = calc_def_yaw(ui.get(c.def_yaw),0,c,phase)
+        local yaw_mode = ui.get(c.def_yaw)
+        local yaw_phase = yaw_mode == "Custom Way" and pro.custom_way_phase(c,cmd) or phase
+        cache.yaw = calc_def_yaw(yaw_mode,0,c,yaw_phase)
         cache.base = ui.get(c.yaw_base)
         if cache.yaw then cache.yaw=math.max(-179,math.min(179,normalize_yaw(cache.yaw))) end
         s.cache, s.phase_tick, s.config_key = cache, phase, key
@@ -2259,14 +2548,15 @@ end
 
 local function apply_defensive(c, cmd, me)
     local selected = tostring(ui.get(defensive_backend) or "")
-    local backend = string.find(selected, "Ünoins Pro", 1, true) and "UnoinsPro"
-        or string.find(selected, "Ünoins", 1, true) and "Unoins" or "Gamesense"
+    local backend = string.find(selected, "Ünoins_qucy Pro", 1, true) and "UnoinsPro"
+        or string.find(selected, "Ünoins_qucy", 1, true) and "Unoins" or "Gamesense"
     if active_defensive_backend ~= backend then
         clear_defensive_timings(true)
         active_defensive_backend = backend
     end
-    if backend == "UnoinsPro" then return pro.apply(c, cmd, me) end
-    return apply_timed_defensive(backend, c, cmd, me)
+    if backend == "Gamesense" then return apply_timed_defensive("Gamesense", c, cmd, me) end
+    if backend == "Unoins" then return apply_timed_defensive("Unoins", c, cmd, me) end
+    return pro.apply(c, cmd, me)
 end
 
 local function apply_backstab_safety()
@@ -2328,10 +2618,10 @@ local function finish_hitlog(event, result)
         if event.damage ~= nil then shot.damage = event.damage end
         if event.hitgroup ~= nil then shot.hitgroup = event.hitgroup end
     end
-    local ok, name = pcall(entity.get_player_name, shot.target)
-    if not ok or not name or name == "" then name = tostring(shot.target or "unknown") end
+    local name = shot.target and entity.get_player_name(shot.target)
+    if not name or name == "" then name = tostring(shot.target or "unknown") end
     client.log(string.format(
-        "Ünoins~ %s %s in the %s for %d(bt:%s hc:%d)",
+        "Ünoins_qucy~ %s %s in the %s for %d(bt:%s hc:%d)",
         result,
         name,
         hitlog_hitgroup(shot.hitgroup),
@@ -2341,76 +2631,81 @@ local function finish_hitlog(event, result)
     ))
 end
 local rh_data, rh_shots = {}, {}
-local rh_factors = { 1, -1, 0, 0.55, -0.55 }
+local rh_factors = { 1, -1, 0.5, -0.5, 0 }
 local rh_enabled_last = false
 
 local function rh_reset_player(idx)
-    local force_ok, force_value, yaw_ok, yaw_value = false, nil, false, nil
-    local correction_ok, correction_value = false, nil
-    if plist and type(plist.get) == "function" then
-        force_ok, force_value = pcall(plist.get, idx, "Force body yaw")
-        yaw_ok, yaw_value = pcall(plist.get, idx, "Force body yaw value")
-        correction_ok, correction_value = pcall(plist.get, idx, "Correction active")
-    end
     rh_data[idx] = {
-        original_force_ok = force_ok,
-        original_force = force_value,
-        original_yaw_ok = yaw_ok,
-        original_yaw = yaw_value,
-        original_correction_ok = correction_ok,
-        original_correction = correction_value,
-        left_score = 0,
-        right_score = 0,
+        memory_id = nil,
+        misses = 0,
         side = 1,
-        magnitude = 58,
+        brute_idx = 1,
         last_simtime = nil,
         last_eye_yaw = nil,
-        brute_idx = 1,
+        jitter_score = 0,
+        jitter_sign = 1,
         applied_yaw = nil,
-        locked_yaw = nil,
-        locked_until = 0,
-        revision = 0,
-        signal_until = 0,
-        candidates = nil,
-        last_duck = nil,
-        eligible = false,
         override_active = false
     }
 end
 
 local function rh_clear_override(idx)
-    if not plist or type(plist.set) ~= "function" then return end
     local d = rh_data[idx]
-    if not d or not d.override_active then return end
-    if d.original_yaw_ok then pcall(plist.set, idx, "Force body yaw value", d.original_yaw) end
-    pcall(plist.set, idx, "Force body yaw", d.original_force_ok and d.original_force or false)
-    if d.original_correction_ok then pcall(plist.set, idx, "Correction active", d.original_correction) end
-    d.applied_yaw = nil
+    if not d or not d.override_active then return true end
+    d.restore_pending = true
+    if d.owner ~= nil and type(entity.get_steam64) == "function" then
+        local ok, owner = checked_call("resolver restore identity", entity.get_steam64, idx)
+        if not ok or owner == nil then return false end
+        if owner ~= d.owner then
+            client.error_log("[Ünoins_qucy] Resolver restore skipped: player identity changed; new player left untouched.")
+            d.override_active, d.restore_pending, d.applied_yaw = false, nil, nil
+            return true
+        end
+    end
+    if not plist or type(plist.set) ~= "function" or type(plist.get) ~= "function" then return false end
+    local restored = true
+    local function restore(key, value)
+        local ok = checked_call("restore resolver " .. key, function()
+            plist.set(idx, key, value)
+            assert(plist.get(idx, key) == value, "restore readback mismatch")
+        end)
+        restored = ok and restored
+    end
+    if d.original_yaw_ok then restore("Force body yaw value", d.original_yaw) end
+    restore("Force body yaw", d.original_force_ok and d.original_force or false)
+    if d.original_correction_ok then restore("Correction active", d.original_correction) end
+    if not restored then return false end
+    d.applied_yaw, d.restore_pending = nil, nil
     d.override_active = false
+    return true
 end
 
 local function rh_apply_override(idx, yaw)
     if not plist or type(plist.set) ~= "function" then return false end
     local d = rh_data[idx]
     if not d then return false end
+    if d.restore_pending and not rh_clear_override(idx) then return false end
     yaw = math.max(-60, math.min(60, yaw or 0))
     yaw = yaw >= 0 and math.floor(yaw + 0.5) or math.ceil(yaw - 0.5)
     if d.override_active and d.applied_yaw == yaw then return true end
     if not d.override_active then
-        local a, force = pcall(plist.get, idx, "Force body yaw")
-        local b, value = pcall(plist.get, idx, "Force body yaw value")
-        local c, correction = pcall(plist.get, idx, "Correction active")
-        if not a or not b or not c or type(force) ~= "boolean"
+        local ok, force, value, correction = checked_call("rh_apply_override", function()
+            return plist.get(idx, "Force body yaw"), plist.get(idx, "Force body yaw value"), plist.get(idx, "Correction active")
+        end)
+        if not ok or type(force) ~= "boolean"
             or type(value) ~= "number" or type(correction) ~= "boolean" then return false end
+        d.owner = type(entity.get_steam64) == "function" and entity.get_steam64(idx) or nil
         d.original_force_ok, d.original_force = true, force
         d.original_yaw_ok, d.original_yaw = true, value
         d.original_correction_ok, d.original_correction = true, correction
     end
     d.override_active = true
-    local ok1 = pcall(plist.set, idx, "Correction active", true)
-    local ok2 = pcall(plist.set, idx, "Force body yaw value", yaw)
-    local ok3 = pcall(plist.set, idx, "Force body yaw", true)
-    if ok1 and ok2 and ok3 then
+    local ok = checked_call("rh_apply_override", function()
+        plist.set(idx, "Correction active", true)
+        plist.set(idx, "Force body yaw value", yaw)
+        plist.set(idx, "Force body yaw", true)
+    end)
+    if ok then
         d.applied_yaw = yaw
         d.override_active = true
         return true
@@ -2420,10 +2715,25 @@ local function rh_apply_override(idx, yaw)
 end
 
 local function rh_clear_all()
-    for idx in pairs(rh_data) do rh_clear_override(idx) end
-    rh_data = {}
+    for idx, d in pairs(rh_data) do
+        if rh_clear_override(idx) then rh_data[idx] = nil else d.discard = true end
+    end
     rh_shots = {}
 end
+
+local function rh_release_all()
+    for idx in pairs(rh_data) do rh_clear_override(idx) end
+    rh_shots = {}
+end
+local rh_restore_time
+client.set_event_callback("paint_ui", function()
+    local now = globals.realtime()
+    if rh_restore_time and now >= rh_restore_time and now-rh_restore_time < 0.5 then return end
+    rh_restore_time = now
+    for idx, d in pairs(rh_data) do
+        if d.restore_pending and rh_clear_override(idx) and d.discard then rh_data[idx] = nil end
+    end
+end)
 ui.set_callback(rh_enabled, function()
     if not ui.get(rh_enabled) then
         rh_clear_all()
@@ -2432,23 +2742,18 @@ ui.set_callback(rh_enabled, function()
     update_vis()
 end)
 
-local function rh_add_score(d, side, amount)
-    if side > 0 then
-        d.right_score = d.right_score + amount
-    elseif side < 0 then
-        d.left_score = d.left_score + amount
-    end
+local function rh_magnitude(idx)
+    local flags = entity.get_prop(idx, "m_fFlags") or 0
+    if bit.band(flags, 1) == 0 then return 29 end
+    local vx = entity.get_prop(idx, "m_vecVelocity[0]") or 0
+    local vy = entity.get_prop(idx, "m_vecVelocity[1]") or 0
+    return math.max(29, 58 - math.sqrt(vx * vx + vy * vy) * 0.116)
 end
 
-local function rh_invalidate(d)
-    d.revision = d.revision + 1
-    d.eligible = false
-    d.signal_until = 0
-    d.left_score, d.right_score = 0, 0
-    d.brute_idx = 1
-    d.candidates = nil
-    d.locked_yaw, d.locked_until = nil, 0
-    d.last_eye_yaw, d.last_duck = nil, nil
+local function rh_gamesense_side(idx)
+    local pose = entity.get_prop(idx, "m_flPoseParameter", 11)
+    if not pro.finite(pose) then return 1 end
+    return pose * 120 - 60 >= 0 and 1 or -1
 end
 
 local function rh_feedback(e)
@@ -2457,101 +2762,49 @@ local function rh_feedback(e)
     if not shot or (e.target and e.target ~= shot.target) then return end
     local d = rh_data[shot.target]
     local now = globals.realtime()
-    if not d or d ~= shot.state or d.revision ~= shot.revision
-        or not d.eligible or not d.override_active or now > d.signal_until
-        or now - shot.time > 2 or now < shot.time
-        or not entity.is_alive(shot.target) or entity.is_dormant(shot.target) then return end
-    local flags = entity.get_prop(shot.target, "m_fFlags") or 0
-    local vx = entity.get_prop(shot.target, "m_vecVelocity[0]") or 0
-    local vy = entity.get_prop(shot.target, "m_vecVelocity[1]") or 0
-    local _, eye = entity.get_prop(shot.target, "m_angEyeAngles")
-    local duck = (entity.get_prop(shot.target, "m_flDuckAmount") or 0) >= 0.5
-    if bit.band(flags, 1) == 0 or vx * vx + vy * vy > 400
-        or duck ~= shot.duck
-        or (eye and shot.eye and math.abs(normalize_yaw(eye - shot.eye)) >= 35) then return end
+    if not d or d ~= shot.state or now - shot.time > 2 or now < shot.time then return end
     return d, shot
 end
 
 local function rh_update_player(idx)
     if not rh_data[idx] then rh_reset_player(idx) end
     local d = rh_data[idx]
+    if type(entity.get_steam64) == "function" then
+        local ok, id = checked_call("resolver identity", entity.get_steam64, idx)
+        if ok and id ~= nil then
+            if d.memory_id ~= nil and d.memory_id ~= id then
+                if not rh_clear_override(idx) then return end
+                rh_reset_player(idx)
+                d = rh_data[idx]
+            end
+            d.memory_id = id
+        end
+    end
     if not entity.is_alive(idx) or entity.is_dormant(idx) then
-        rh_invalidate(d)
+        d.last_simtime, d.last_eye_yaw = nil, nil
         rh_clear_override(idx)
         return
     end
-    local flags = entity.get_prop(idx, "m_fFlags") or 0
-    local vx = entity.get_prop(idx, "m_vecVelocity[0]") or 0
-    local vy = entity.get_prop(idx, "m_vecVelocity[1]") or 0
-    local speed = math.sqrt(vx * vx + vy * vy)
-    local simtime = entity.get_prop(idx, "m_flSimulationTime") or 0
-    local now = globals.realtime()
-    if d.eligible and now >= d.signal_until then rh_invalidate(d) end
-    if bit.band(flags, 1) == 0 or speed > 20 then
-        rh_invalidate(d)
-        d.last_simtime = simtime
-        rh_clear_override(idx)
-        return
-    end
-    if d.last_simtime ~= simtime then
-        local pose = entity.get_prop(idx, "m_flPoseParameter", 11)
-        local pose_yaw = pose and pose * 120 - 60 or nil
+    local simtime = entity.get_prop(idx, "m_flSimulationTime")
+    if simtime and d.last_simtime ~= simtime then
         local _, eye_yaw = entity.get_prop(idx, "m_angEyeAngles")
-        local lower_body_yaw = entity.get_prop(idx, "m_flLowerBodyYawTarget")
-        local body_delta = eye_yaw and lower_body_yaw and normalize_yaw(eye_yaw - lower_body_yaw) or nil
-        local duck = (entity.get_prop(idx, "m_flDuckAmount") or 0) >= 0.5
-        if (d.last_simtime and simtime < d.last_simtime)
-            or (eye_yaw and d.last_eye_yaw and math.abs(normalize_yaw(eye_yaw - d.last_eye_yaw)) >= 35)
-            or (d.last_duck ~= nil and duck ~= d.last_duck) then
-            rh_invalidate(d)
+        if eye_yaw and d.last_eye_yaw and d.last_simtime and simtime > d.last_simtime then
+            local delta = normalize_yaw(eye_yaw - d.last_eye_yaw)
+            if math.abs(delta) >= 20 then
+                d.jitter_score = math.min(4, d.jitter_score + 1)
+                d.jitter_sign = delta > 0 and 1 or -1
+            else
+                d.jitter_score = math.max(0, d.jitter_score - 0.5)
+            end
         end
-        d.last_duck = duck
-        d.left_score = d.left_score * 0.8
-        d.right_score = d.right_score * 0.8
-        local signal = false
-        local target_magnitude = d.magnitude
-        if pose_yaw and math.abs(pose_yaw) >= 5 then
-            rh_add_score(d, pose_yaw > 0 and 1 or -1, 1)
-            target_magnitude = math.max(25, math.min(60, math.abs(pose_yaw)))
-            signal = true
-        end
-        if body_delta and math.abs(body_delta) >= 15 then
-            rh_add_score(d, body_delta > 0 and 1 or -1, 0.35)
-            target_magnitude = math.max(target_magnitude, math.min(60, math.abs(body_delta)))
-            signal = true
-        end
-        local score_delta = d.right_score - d.left_score
-        if math.abs(score_delta) >= 0.25 then d.side = score_delta > 0 and 1 or -1 end
-        d.magnitude = d.magnitude * 0.65 + target_magnitude * 0.35
-        if signal then d.signal_until = now + 0.25 end
-        d.eligible = now < d.signal_until
-        d.last_eye_yaw = eye_yaw
-        d.last_simtime = simtime
+        d.last_eye_yaw, d.last_simtime = eye_yaw, simtime
     end
-    if not d.eligible or now >= d.signal_until then
-        rh_invalidate(d)
+    if d.misses == 0 then
         rh_clear_override(idx)
         return
     end
-    local base = d.side * math.max(25, math.min(60, d.magnitude))
-    if d.candidates and math.abs(base - d.candidates[1]) > 15 then
-        d.revision = d.revision + 1
-        d.candidates = nil
-        d.brute_idx = 1
-        d.locked_yaw, d.locked_until = nil, 0
-    end
-    if not d.candidates then
-        d.candidates = {}
-        for i = 1, #rh_factors do d.candidates[i] = base * rh_factors[i] end
-    end
-    local yaw
-    if d.locked_yaw ~= nil and now < d.locked_until then
-        yaw = d.locked_yaw
-    else
-        d.locked_yaw = nil
-        yaw = d.candidates[d.brute_idx]
-    end
-    rh_apply_override(idx, yaw)
+    local sign = d.side * (d.jitter_score >= 2 and d.jitter_sign or 1)
+    rh_apply_override(idx, rh_factors[d.brute_idx] * sign * rh_magnitude(idx))
 end
 
 local function rh_run()
@@ -2564,10 +2817,10 @@ local function rh_run()
         seen[idx] = true
         rh_update_player(idx)
     end
-    for idx in pairs(rh_data) do
+    for idx, d in pairs(rh_data) do
         if not seen[idx] then
+            d.last_simtime, d.last_eye_yaw = nil, nil
             rh_clear_override(idx)
-            rh_data[idx] = nil
         end
     end
 end
@@ -2578,7 +2831,7 @@ client.set_event_callback("net_update_end", function()
         rh_enabled_last = true
         rh_run()
     elseif rh_enabled_last then
-        rh_clear_all()
+        rh_release_all()
         rh_enabled_last = false
     end
 end)
@@ -2594,51 +2847,43 @@ client.set_event_callback("aim_fire", function(e)
         }
     end
     if not ui.get(master) or not ui.get(rh_enabled) or not e.id or not e.target then return end
+    if not rh_data[e.target] then rh_reset_player(e.target) end
     local d = rh_data[e.target]
-    if not d or not d.eligible or not d.override_active or d.applied_yaw == nil then return end
     rh_shots[e.id] = {
         target = e.target,
         state = d,
-        revision = d.revision,
         time = globals.realtime(),
-        eye = d.last_eye_yaw,
-        duck = d.last_duck,
-        yaw = d.applied_yaw,
-        brute_idx = d.brute_idx
+        overridden = d.override_active and d.applied_yaw ~= nil,
+        brute_idx = d.brute_idx,
+        gs_side = rh_gamesense_side(e.target),
+        jitter = d.jitter_score >= 2,
+        jitter_sign = d.jitter_sign
     }
 end)
 
 client.set_event_callback("aim_hit", function(e)
     finish_hitlog(e, "Hit")
     if not ui.get(master) or not ui.get(rh_enabled) then return end
-    local d, shot = rh_feedback(e)
-    if not d then return end
-    d.locked_yaw = shot.yaw
-    d.locked_until = globals.realtime() + 0.5
-    d.brute_idx = shot.brute_idx
-    d.revision = d.revision + 1
+    rh_feedback(e)
 end)
 
 client.set_event_callback("aim_miss", function(e)
     finish_hitlog(e, "Miss")
     if not ui.get(master) or not ui.get(rh_enabled) then return end
     local d, shot = rh_feedback(e)
-    if not d then return end
-    if e.reason == "?" then
-        d.locked_yaw = nil
-        d.locked_until = 0
+    if not d or e.reason ~= "?" then return end
+    if not shot.overridden or d.misses == 0 then
+        d.side = -shot.gs_side * (shot.jitter and shot.jitter_sign or 1)
+        d.brute_idx = 1
+    else
         d.brute_idx = shot.brute_idx % #rh_factors + 1
-        d.revision = d.revision + 1
     end
-    if e.id then rh_shots[e.id] = nil end
+    d.misses = d.misses + 1
 end)
 
 client.set_event_callback("player_death", function(e)
     local idx = e and e.userid and client.userid_to_entindex(e.userid) or nil
-    if idx and rh_data[idx] then
-        rh_clear_override(idx)
-        rh_data[idx] = nil
-    end
+    if idx and rh_data[idx] then rh_clear_override(idx) end
 end)
 
 client.set_event_callback("level_init", function()
@@ -2648,8 +2893,29 @@ end)
 
 client.set_event_callback("round_prestart", function()
     hitlog_shots = {}
-    rh_clear_all()
+    rh_release_all()
 end)
+
+local ladder_started = false
+
+local function fast_ladder_command(cmd, me)
+    if (entity.get_prop(me, "m_MoveType") or 0) ~= 9 or (cmd.forwardmove or 0) == 0 then
+        ladder_started = false
+        return
+    end
+    local weapon = entity.get_player_weapon(me)
+    if weapon and (entity.get_prop(weapon, "m_fThrowTime") or 0) ~= 0 then return end
+    if not ladder_started then
+        ladder_started = true
+        return
+    end
+    local pitch = client.camera_angles()
+    local down = cmd.forwardmove < 0 or (pitch or 0) > 45
+    cmd.in_moveleft, cmd.in_moveright = down and 1 or 0, down and 0 or 1
+    cmd.in_forward, cmd.in_back = down and 1 or 0, down and 0 or 1
+    cmd.pitch = 89
+    cmd.yaw = normalize_yaw((cmd.move_yaw or cmd.yaw or 0) + 90)
+end
 
 local function apply_micromovement(me, cmd)
     if not me or not entity.is_alive(me) then return end
@@ -2679,8 +2945,10 @@ client.set_event_callback("setup_command", function(cmd)
     aa_cancel()
     if not ui.get(master) then
         current_layer = "disabled"
+        extras.native_set("moving_hitchance",extras.hitchance_ref,nil)
         return
     end
+    capture_native()
     local me = entity.get_local_player()
     if not me or not entity.is_alive(me) then
         if rh_enabled_last then
@@ -2691,16 +2959,16 @@ client.set_event_callback("setup_command", function(cmd)
         apply_native_freestand(false)
         reset_defensive_state()
         current_layer = "dead"
+        extras.native_set("moving_hitchance",extras.hitchance_ref,nil)
         return
     end
     extras.pre_command(cmd, me)
-    if ui.get(fast_ladder) and (entity.get_prop(me, "m_MoveType") or 0) == 9 then
-        cmd.forwardmove = 450
-    end
+    if ui.get(fast_ladder) then fast_ladder_command(cmd, me) end
     defensive_state.choked = cmd.chokedcommands or 0
     update_manual()
     local move_cond
     current_cond, move_cond = get_condition(me, cmd)
+    extras.hitchance_control()
     update_aa_sequence(cmd)
     slow_pro.update(cmd, me)
     aa_begin(current_cond == "manual" and 70 or freestand_requested and 85 or 10)
@@ -2730,12 +2998,12 @@ client.set_event_callback("setup_command", function(cmd)
             apply_safe_head(cmd)
             current_layer = "safe_head"
         else
-            aa_owner(80)
+            aa_owner(88)
             local defensive_active = apply_defensive(c, cmd, me)
-            if freestand_requested then
-                current_layer = "freestand"
-            elseif defensive_active then
+            if defensive_active then
                 current_layer = "defensive"
+            elseif freestand_requested then
+                current_layer = "freestand"
             elseif defensive_state.request then
                 current_layer = "request"
             else
@@ -2754,16 +3022,17 @@ client.set_event_callback("setup_command", function(cmd)
 end)
 local clan_full_strs = {
     ["Half-life.beta"] = "Half-life.lua",
-    ["Ünoins.qucy"] = "Ünoins.qucy",
+    ["Ünoins_qucy"] = "Ünoins_qucy",
     ["gamesense"] = "gamesense",
     ["Ideal Yaw"] = "Ideal Yaw",
 }
 local clan_idx, clan_dir, clan_timer, prev_clan_mode, current_clan_tag = 1, 1, 0, "Off", nil
 
 local function set_script_clan_tag(tag)
+    if tag == "" and current_clan_tag == nil then return end
     if current_clan_tag == tag then return end
     client.set_clan_tag(tag)
-    current_clan_tag = tag
+    current_clan_tag = tag ~= "" and tag or nil
 end
 
 client.set_event_callback("net_update_start", function()
@@ -2823,7 +3092,7 @@ client.set_event_callback("paint", function()
     if not ui.get(master) then return end
     local me = entity.get_local_player() if not me or not entity.is_alive(me) then return end
     draw_min_damage()
-    if has_trigger(indicator_sel, "Ünoins") then
+    if has_trigger(indicator_sel, "Ünoins_qucy") then
         local w, h = client.screen_size()
         local cr, cg, cb, ca = 255, 245, 157, 255
         local col = cond_colors[current_cond] or {255, 245, 157}
@@ -2841,7 +3110,7 @@ client.set_event_callback("paint", function()
         renderer.rectangle(bx+icon-1, by, 1, icon, cr, cg, cb, ca)
         local tx = bx + icon + 6
         if show_group then
-            renderer.text(tx, by - 1, cr, cg, cb, ca, "b", 0, "ÜNOINS")
+            renderer.text(tx, by - 1, cr, cg, cb, ca, "b", 0, "ÜNOINS_QUCY")
             renderer.text(tx, by + 9, col[1], col[2], col[3], 255, nil, 0, label)
         else
             renderer.text(tx, by + 4, col[1], col[2], col[3], 255, "b", 0, label)
@@ -2916,17 +3185,17 @@ end)
 client.set_event_callback("shutdown", function()
     extras.cleanup()
     restore_tp_viewmodel()
-    restore_communication()
     hitlog_shots = {}
     rh_clear_all()
-    if ui.get(master) then reset_native() end
+    reset_native()
     invalidate_freestand_controller()
     reset_aa_sequence()
     reset_defensive_state()
-    show_native()
+    native_visible(true)
     set_script_clan_tag("")
 end)
 
+extras.hitchance_ref = safe_ref("RAGE", "Aimbot", "Minimum hit chance")
 extras.scope_ref = safe_ref("VISUALS", "Effects", "Remove scope overlay")
 extras.legs_ref = safe_ref(TAB, "Other", "Leg movement")
 extras.hotkey_modes = {"Always on", "On hotkey", "Toggle", "Off hotkey"}
@@ -2938,9 +3207,7 @@ extras.effect_groups = {
 }
 extras.grenades = {CHEGrenade="HE", CSmokeGrenade="Smoke", CMolotovGrenade="Fire", CIncendiaryGrenade="Fire", CFlashbang="Flash", CDecoyGrenade="Decoy"}
 
-function extras.finite(n)
-    return type(n) == "number" and n == n and n > -math.huge and n < math.huge
-end
+extras.finite = pro.finite
 
 function extras.live()
     local me = entity.get_local_player()
@@ -2960,24 +3227,35 @@ function extras.cvar_set(key, name, value)
     local saved = extras.cvars[key]
     local cv = saved and saved.ref or cvar and cvar[name]
     if not cv then return false end
-    local ok, current = pcall(function() return cv:get_string() end)
-    if not ok or current == nil then return false end
+    local ok, current = checked_call("extras.cvar_set", function() return cv:get_string() end)
+    if not ok or current == nil then
+        if saved and value == nil then saved.restore_pending = true end
+        return false
+    end
     current = tostring(current)
     if value == nil then
-        if saved and current == saved.written then pcall(function() cv:set_string(saved.before) end) end
+        if saved and current == saved.written then
+            saved.restore_pending = true
+            local restored = checked_call("restore cvar " .. key, function()
+                cv:set_string(saved.before)
+                assert(tostring(cv:get_string()) == saved.before, "restore readback mismatch")
+            end)
+            if not restored then return false end
+        end
         extras.cvars[key] = nil
         return true
     end
     local wanted = tostring(value)
+    if saved then saved.restore_pending = nil end
     if not saved then saved = {ref=cv, before=current}; extras.cvars[key] = saved
     elseif saved.written and current ~= saved.written then saved.before = current end
     if current ~= wanted then
-        ok = pcall(function()
+        ok = checked_call("extras.cvar_set", function()
             if type(value) == "number" then cv:set_int(value) else cv:set_string(value) end
         end)
         if not ok then return false end
     end
-    local read_ok, written = pcall(function() return cv:get_string() end)
+    local read_ok, written = checked_call("extras.cvar_set", function() return cv:get_string() end)
     if read_ok and written ~= nil then saved.written = tostring(written) end
     return read_ok and saved.written == wanted
 end
@@ -2986,25 +3264,75 @@ function extras.native_set(key, ref, value)
     local saved = extras.native[key]
     ref = saved and saved.ref or ref
     if not ref then return false end
-    local ok, current = pcall(ui.get, ref)
-    if not ok then return false end
+    local current = ui.get(ref)
     if value == nil then
-        if saved and current == saved.written then pcall(ui.set, ref, saved.before) end
+        if saved and current == saved.written then ui.set(ref, saved.before) end
         extras.native[key] = nil
         return true
     end
     if not saved then saved={ref=ref, before=current}; extras.native[key]=saved
     elseif current ~= saved.written then saved.before=current end
-    if current ~= value and not pcall(ui.set, ref, value) then return false end
+    if current ~= value then ui.set(ref, value) end
     saved.written=value
     return true
+end
+
+function extras.hitchance_dt_off()
+    local ref=hl_ref.dt
+    if not ref or not ref[1] then return false end
+    local ok,enabled=checked_call("extras.hitchance_dt_off", ui.get,ref[1])
+    if not ok or type(enabled)~="boolean" then return false end
+    if not enabled then return true end
+    if not ref[2] then return false end
+    local key_ok,active=checked_call("extras.hitchance_dt_off", ui.get,ref[2])
+    return key_ok and active==false
+end
+
+extras.release_weapons = {[40]="SSG 08", [38]="SCAR-20", [11]="G3SG1", [9]="AWP", [1]="Desert Eagle", [64]="R8 Revolver"}
+
+function extras.weapon_id(me)
+    local weapon=entity.get_player_weapon(me)
+    if not weapon or weapon==0 then return end
+    local id=entity.get_prop(weapon,"m_iItemDefinitionIndex")
+    if not extras.finite(id) or id%1~=0 then return end
+    return bit.band(id,0xFFFF),weapon
+end
+
+function extras.hitchance_control()
+    local live,me=extras.live()
+    local id,weapon
+    if live and (ui.get(extras.ui.move_hitchance) or ui.get(extras.ui.noscope_hitchance)) then id,weapon=extras.weapon_id(me) end
+    local name=extras.release_weapons[id]
+    local wanted=live and name and ui.get(extras.ui.move_hitchance)
+        and extras.has(extras.ui.move_hitchance_weapons,name) and current_cond=="Moving"
+    if wanted then
+        local vx,vy=entity.get_prop(me,"m_vecVelocity[0]"),entity.get_prop(me,"m_vecVelocity[1]")
+        local flags,move=entity.get_prop(me,"m_fFlags"),entity.get_prop(me,"m_MoveType")
+        local duck=entity.get_prop(me,"m_flDuckAmount")
+        wanted=extras.finite(vx) and extras.finite(vy) and vx*vx+vy*vy>25
+            and extras.finite(flags) and bit.band(flags,1)~=0 and bit.band(flags,64)==0
+            and move~=8 and move~=9 and extras.finite(duck) and duck~=1
+            and not (slow_key and ui.get(slow_key)) and extras.hitchance_dt_off()
+    end
+    local value
+    if wanted then
+        value=ui.get(extras.ui.move_hitchance_value)
+    elseif live and ui.get(extras.ui.noscope_hitchance) and extras.noscope_profiles[id] then
+        local zoom=entity.get_prop(weapon,"m_zoomLevel")
+        if extras.finite(zoom) and zoom>=0 then
+            local profile=extras.noscope_profiles[id]
+            value=ui.get(zoom==0 and profile.unscoped or profile.scoped)
+            if value==-1 then value=nil end
+        end
+    end
+    extras.native_set("moving_hitchance",extras.hitchance_ref,value)
 end
 
 function extras.restore_fd()
     local saved = extras.fd
     if not saved then return end
-    local ok, _, mode, key = pcall(ui.get, pro.duck)
-    if ok and mode == 1 and key == 0 then pcall(ui.set, pro.duck, extras.hotkey_modes[saved.mode+1], saved.key) end
+    local _, mode, key = ui.get(pro.duck)
+    if mode == 1 and key == 0 then ui.set(pro.duck, extras.hotkey_modes[saved.mode+1], saved.key) end
     extras.fd = nil
 end
 
@@ -3014,7 +3342,7 @@ function extras.pose_restore()
         if me == saved.me and entity.is_alive(me) and type(entity.set_prop) == "function" then
             local value = entity.get_prop(me, "m_flPoseParameter", index)
             if extras.finite(value) and math.abs(value-saved.written) < 0.00001 then
-                pcall(entity.set_prop, me, "m_flPoseParameter", saved.before, index)
+                entity.set_prop(me, "m_flPoseParameter", saved.before, index)
             end
         end
     end
@@ -3034,6 +3362,11 @@ function extras.cleanup()
 end
 
 function extras.sync()
+    if extras.config_loading then return end
+    for key, saved in pairs(extras.cvars) do
+        if saved.restore_pending then extras.cvar_set(key, nil, nil) end
+    end
+    extras.hitchance_control()
     local live = extras.live()
     local wanted = {}
     if live and ui.get(extras.ui.fps) then
@@ -3049,9 +3382,7 @@ function extras.sync()
         if key:sub(1,4) == "fps:" and not wanted[key] then extras.cvar_set(key, nil, nil) end
     end
     if live and ui.get(extras.ui.console) then
-        local filter = tostring(ui.get(extras.ui.console_text) or ""):sub(1,64)
-        if filter == "" then filter = "gamesense" end
-        extras.cvar_set("console:text", "con_filter_text", filter)
+        extras.cvar_set("console:text", "con_filter_text", "gamesense")
         extras.cvar_set("console:enable", "con_filter_enable", 1)
     else
         extras.cvar_set("console:enable", "con_filter_enable", nil)
@@ -3082,9 +3413,10 @@ function extras.duck_command(cmd, me)
         and (entity.get_prop(me,"m_flDuckAmount") or 0) > 0.75
     if not wanted then extras.restore_fd(); return end
     if extras.fd then return end
-    local ok, active, mode, key = pcall(ui.get, pro.duck)
-    if ok and active and extras.hotkey_modes[(tonumber(mode) or -1)+1] and type(key) == "number" then
-        if pcall(ui.set, pro.duck, "On hotkey", 0) then extras.fd = {mode=mode, key=key} end
+    local active, mode, key = ui.get(pro.duck)
+    if active and extras.hotkey_modes[(tonumber(mode) or -1)+1] and type(key) == "number" then
+        ui.set(pro.duck, "On hotkey", 0)
+        extras.fd = {mode=mode, key=key}
     end
 end
 
@@ -3171,8 +3503,7 @@ function extras.stop_command(cmd, me)
             for _, box in ipairs({0,4}) do
                 local x,y,z = entity.hitbox_position(candidates[i].ent,box)
                 if extras.finite(x) and extras.finite(y) and extras.finite(z) and type(client.visible)=="function" then
-                    local ok, visible = pcall(client.visible,x,y,z)
-                    if ok and visible then wanted=true; break end
+                    if client.visible(x,y,z) then wanted=true; break end
                 end
             end
             if wanted then break end
@@ -3208,9 +3539,8 @@ function extras.pose_write(me, index, value)
     local before = entity.get_prop(me,"m_flPoseParameter",index)
     if not extras.finite(before) then return end
     value = math.max(0,math.min(1,value))
-    if pcall(entity.set_prop,me,"m_flPoseParameter",value,index) then
-        extras.pose[index]={me=me,before=before,written=value}
-    end
+    entity.set_prop(me,"m_flPoseParameter",value,index)
+    extras.pose[index]={me=me,before=before,written=value}
 end
 
 function extras.anim_frame()
@@ -3277,7 +3607,7 @@ function extras.scope_paint()
     local x,y=math.floor(sw/2),math.floor(sh/2)
     local r,g,b,a=ui.get(extras.ui.scope_color)
     local gap,length,width=ui.get(extras.ui.scope_gap),ui.get(extras.ui.scope_length),ui.get(extras.ui.scope_width)
-    local coverage=width==1 and 0.6 or 1
+    local coverage=width==1 and 0.35 or 1
     local style=ui.get(extras.ui.scope_style)
     for _,arm in ipairs({{"Top",0,-1},{"Bottom",0,1},{"Left",-1,0},{"Right",1,0}}) do
         if not extras.has(extras.ui.scope_exclude,arm[1]) then
@@ -3426,6 +3756,7 @@ function extras.velocity_draw(value,s,now,preview,fading)
 end
 
 function extras.changed()
+    if extras.config_loading then return end
     last_fl.on=nil
     extras.sync()
     extras.scope_control()
@@ -3461,6 +3792,132 @@ client.set_event_callback("round_prestart",extras.cleanup)
 client.set_event_callback("player_death",function(e)
     if e and client.userid_to_entindex(e.userid)==entity.get_local_player() then extras.cleanup() end
 end)
+extras.qucy={alpha=0,channels={}}
+
+function extras.qucy_read(now,live)
+    if not live then
+        local phase=math.floor(now/2.4)%3
+        return {preview=true,flags={DT=phase~=1,HS=phase==1,FD=false,FS=phase==2}}
+    end
+    return {preview=false,flags={DT=hl_active(hl_ref.dt),HS=hl_active(hl_ref.os),FD=pro.duck and ui.get(pro.duck)==true or false,
+        FS=freestand_applied==true and ui.get(fs_hotkey)==true and N.freestand~=nil and ui.get(N.freestand)==true}}
+end
+
+local qucy_starry_b64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAIN0lEQVR4nL1XD0xT2xk/596WUigtlEKhrUCpUGBYEkAqeQlEQvgzl0wfEYIQAWfMW8icMWAUTRRmJA4D0Yznxnxuc/5hsYZIVBghWNmccVHytiBQIKioQMHyp/YP7eXes3z3UcOUZc6n+5J7z3fuOfd83/l+359zEPrvRCOEMPo/EAWv4uLiQwaD4WFGRsY3xcXFX/gGe3t7+fHPSXh+fp6Oi4sbj4qKIrGxsSQuLo6kpaX9qq2tTQwT6urq6M8mHCGEysrKIvV6/YJarWZjYmK80dHRbEREBCjyqKWlZSPM2bVrl+CTC0bftYQQIo6IiLAIhcINQqGQYxiGksvljFKpFNrt9imxWLzNbDZ/W15eLrh8+fLKp1CAeqfPcBy3QlEUcrlcSKPRILlcLrRYLCvPnz9XTU1N9ebn56eB8MLCQuGnVICAFTDGKxqNxsZxHNJqtcjpdKKhoSEYEIjFYpZhmNCnT5/+edOmTaldXV1MX18f/39ra6uAEPJRTkqt4XkHCwgIGBGJRMjhcHDz8/PQR2ARQgjtdru5ubm5ULFYfC89Pb02JyeHg39sNlvkoUOHlGvg/OCwFfiY0tJSdO3aNdjtIMYY2e12JBQKoY+8Xi//qNVqatu2bVx8fLxkYGDgl/Pz899OTEz0jo+PByCE5tYowP3PFnC5XHwrFAqfE0J4wfAADP7+/shoNKKWlhYUFxdHtbW1MY8ePSJJSUk/A/g4wGyN8ObmZtk7lsC3b9+m9u7dS0O71kKUj0lKSgI/QBzHTdA0jwa9srKCQkJCkMFgQPv370cPHz5Ehw8fBr8QDg8Pc1ar9UclJSU/PHr06ITb7Q4BZerr63UOhyMJeIwxvybwYLkLFy6w0K76HC8br7EGz09OTooyMzPHhEKhyuFwoMTERKq6uhoxDIMqKytRWFgYCg4OBkU58Fq1Wj3DMMwPDhw4sFJUVMSdPHky+NixY69W1/NHCLn37Nmj0Gg0SovFIn39+vVSb2/vsE85vBYPyHSnTp1is7Kyfvrs2bOvw8LC2PT0dLqqqgqBEhMTE0ihUIBDIoFAgFiWZRUKBU1R1K9dLtfdtLS0qpGRkfq5uTkSFRX1tVQqDRkeHp632+2x8fHxwdPT03hxcRHyy9+Tk5N/Yjabh/8tdED4kSNH6P7+/vM6na41IiKCjo2NZV++fIksFgsPhw9uaEUiEe3xeIhMJvtKq9X+KSEhoSA8PNzsdDr/kpCQkEpRlHZ2djaN47gQu92OYS7DMOyGDRu2iMXigwDFu7GLGxsbYYeUwWDoDQoKcrndbspisRCpVMqHI4Ql7B4cFCzhcDgwjI+MjBCTycSOj4+L7HY7ZE5uamqKI4RwUqmUgOW8Xi8RiURCpVLpSk5O/j3IWy95sBUVFdevX7/ecevWLX+JRII3btyIwRFZluV3Dg8IByf1eDzwHfv5+WGr1Uq/ePGCREdHk/T0dGphYQHWp2CNsbEx1uVyQZFzIoT2NzU1/bW2tpZ6q8DNmzeBJ4ODgylPnjwpAKz0ej2GfODn58cLA8Eg0MeDFSBiVqOG74NvGo1GMDeanp4G2Fiv18t6PB6Akw4PD8/r7u7+pqysTNDU1MSuzQM8Pzg4mOF2uwMCAwMhvvHo6ChaXl5GEokEhYeH88qAQBAGtQLggDFIWpA55XI5KioqQl1dXaAsC+EMlJqa+g+5XP7ljRs3/rZ7927BlStX+GJG+RS4d+8eHxYWi0UDWIEQWHRychLNzs6iwsJCFBUVBY7HzwefmJmZ4ZUCWlpa4pU7ceIEun//Pnv37l1Wo9HQGOMenU63p7OzM7Wnp6cDZF66dOltJaV8DMQ5kFwuh2oIIY4CAwP5ojQ+Ps5jHhQUBFmRBAUFERAOSgC9evUKxcTEoNOnT0NJh4xJa7VaWqVS1Y+OjhaaTKbfQeAcP36cfjdNUz7m7NmzfD8jI6MrJCTE5vV6McdxvFXcbjcaGBhAMpkMRUZGYoZhMPBgEbASmLy2thYshRsaGpiEhARzXl7el2az+QQkHMAb1qmvrwdI1i9GEomET5EymUyhUqneDA0NyaEAARTgiOB0AI1AIFj2eDyLmZmZkVqtluTk5GCFQsGaTCaqr6+vMyUlpa6jo2Po8ePHvg0SH97rEQWvnp4efuLFixfP19XVdc3NzcWEhoaSxcVFyFy8E75584YLCAiAfqfBYJhQq9X8EQoSVHt7O+ns7MQ6ne4xCNfr9X6Q0FbN7asH6ytw9epVQV5eHtfe3v7zBw8efKVUKkcg5Xq9Xgri1maz8cLB1G63+4lIJBpUqVRfWK1WbmZmhrLZbOTOnTuUVCpdqKmpMYHXnzt3bqWxsfE9c6+rQH9/P68hnHgqKipqUlJSTkml0lG1Wv10eXkZT05OsjRNsxKJBKx0OjQ09McADZRvp9PJdXd3w5mR2rp16y9yc3OHS0tLcX5+/gefB94jo9EoI4SIKisra6BEQ1bLzc0lRqPxtwcPHkzesWMHyc7OZuPj4wESkpiYSMrLy5sIIYLs7OyPPzGbTCZqaWnp7bnf4XCImpubs1JSUsa2b99+Fb5lZWWdB6VUKhUTExNDNm/e/LK1tbWcEOK3+tsnu0FhH2O32/lLSVVV1Ybk5GQmLCyM02q13L59+/5JCPkuEXwP4dR/+E581zGpVOreuXMnrVAoVvR6/R9SU1Nnt2zZggUCwW8wxvaCggKR716BPhNhQgi/O0KI/5kzZ/5YXV1tdTqdkoaGBso39rFEfcAc/mxXUlIiwBgvMwwzJBKJKgIDAx1WqxVS9mfb+Xr03hny+9K/AH3A5pgJJC2ZAAAAAElFTkSuQmCC"
+local qucy_starry_raw = b64_decode(qucy_starry_b64)
+local qucy_starry_texture
+local qucy_texture_attempts, qucy_texture_retry = 0, nil
+function extras.qucy_emblem_texture()
+    if qucy_starry_texture then return qucy_starry_texture end
+    local now = globals.realtime()
+    if qucy_texture_attempts >= 3 then return end
+    if qucy_texture_retry and now < qucy_texture_retry and now >= qucy_texture_retry-2 then return end
+    qucy_texture_attempts = qucy_texture_attempts + 1
+    qucy_texture_retry = now + 2
+    qucy_starry_texture = renderer.load_png(qucy_starry_raw, 32, 32)
+    if not qucy_starry_texture and qucy_texture_attempts == 1 then
+        client.error_log("[Ünoins_qucy] Indicator PNG failed to load; retrying at most twice. Reload Lua after correcting renderer support.")
+    end
+    return qucy_starry_texture
+end
+
+function extras.qucy_draw(data, s, now)
+    local sw, sh = client.screen_size()
+    local cr, cg, cb, ca = ui.get(extras.ui.qucy_color)
+    local _, height = renderer.measure_text("-", "X")
+    local row = math.max(8, math.min(10, height or 8)) + 3
+    local title = data.preview and "PREVIEW" or "Ünoins_qucy"
+    local title_width = renderer.measure_text("-b", title) or 38
+    local function measure(label) return renderer.measure_text("-", label) or (#label * 5) end
+    local width = math.max(title_width + 20, measure("DT") + measure("HS") + 20, measure("FS") + measure("FD") + 6)
+    local x = math.floor(math.max(4, math.min(sw - width - 5, sw / 2 + 4)))
+    local y = math.floor(math.max(4, math.min(sh - row * 3 - 5, sh / 2 + ui.get(extras.ui.qucy_offset))))
+    local function alpha(a) return math.floor(math.max(0, math.min(255, a * s.alpha * ca / 255)) + 0.5) end
+    local function text(px, py, r, g, b, a, flags, label)
+        renderer.text(px + 1, py + 1, 0, 0, 0, alpha(a * 0.8), flags, width, label)
+        renderer.text(px, py, r, g, b, alpha(a), flags, width, label)
+    end
+    local function path(px, py, points, r, g, b, a)
+        for i = 1, #points - 1 do
+            local p, q = points[i], points[i + 1]
+            renderer.line(px + p[1] + 1, py + p[2] + 1, px + q[1] + 1, py + q[2] + 1, 0, 0, 0, alpha(a * 0.7))
+            renderer.line(px + p[1], py + p[2], px + q[1], py + q[2], r, g, b, alpha(a))
+        end
+    end
+
+    local emblem_alpha = alpha(255)
+    if emblem_alpha > 0 then
+        local emblem = extras.qucy_emblem_texture()
+        if emblem then
+            local pulse = 1 + math.sin(now * 2.8) * 0.04
+            local ew = math.floor(16 * pulse + 0.5)
+            local eh = math.floor(16 * pulse + 0.5)
+            renderer.texture(emblem, x + 1, y - 2, ew, eh, 0, 0, 0, alpha(130), "f")
+            renderer.texture(emblem, x, y - 3, ew, eh, cr, cg, cb, emblem_alpha, "f")
+        end
+    end
+
+    text(x + 19, y, 208, 225, 216, 235, "-b", title)
+    local chars = {}
+    for char in title:gmatch("[%z\1-\127\194-\244][\128-\191]*") do chars[#chars+1] = char end
+    local num_chars = #chars
+    local sweep = (now * 0.24 % 1) * (num_chars + 4) - 2
+    for i = 1, num_chars do
+        local shine = math.max(0, 1 - math.abs(i - sweep) / 1.4)
+        if shine > 0.03 then
+            local prefix = i == 1 and "" or table.concat(chars, "", 1, i - 1)
+            local offset = i == 1 and 0 or (renderer.measure_text("-b", prefix) or 0)
+            renderer.text(x + 19 + offset, y, cr, cg, cb, alpha(shine * 220), "-b", width, chars[i])
+        end
+    end
+
+    local hs_drop = math.max(1, math.floor(((height or 10) - 6) / 2 + 0.5))
+    local dt_drop = math.max(0, math.floor(((height or 10) - 7) / 2 + 0.5))
+    local glyphs = {
+        DT = {{3, 0}, {1, 3}, {2.5, 3}, {0, 7}},
+        HS = {{0, 0}, {4.5, 0}, {4.5, 3}, {2.25, 5.5}, {0, 3}, {0, 0}}
+    }
+    local function status(px, py, key, glyph)
+        local active = s.channels[key] or 0
+        local rr, gg, bb = math.floor(120 + (cr - 120) * active), math.floor(135 + (cg - 135) * active), math.floor(126 + (cb - 126) * active)
+        local opacity = glyph and (85 + 170 * active) or (255 * active)
+        if glyph then
+            path(px, py + (key == "HS" and hs_drop or dt_drop), glyph, rr, gg, bb, opacity * (1 - active * 0.08 * (0.5 + 0.5 * math.sin(now * 2.2))))
+            px = px + 6.5
+        end
+        text(px, py, rr, gg, bb, opacity, "-", key)
+        return px + measure(key) + 4
+    end
+
+    local px = x
+    for _, key in ipairs({"DT", "HS"}) do px = status(px, y + row, key, glyphs[key]) + 1 end
+
+    px = x
+    for _, key in ipairs({"FS", "FD"}) do
+        if (s.channels[key] or 0) > 0.003 then px = status(px, y + row * 2, key) end
+    end
+end
+
+function extras.qucy_paint()
+    local s=extras.qucy
+    local now=globals.realtime()
+    local dt=math.max(0,math.min(0.1,s.time and now-s.time or globals.frametime()))
+    s.time=now
+    local me=entity.get_local_player()
+    local live=me and entity.is_alive(me)
+    local wanted=ui.get(master) and ui.get(indicator_sel)=="Ünoins_qucy new" and (live or ui.is_menu_open())
+    local step=1-math.exp(-dt*14)
+    s.alpha=s.alpha+((wanted and 1 or 0)-s.alpha)*step
+    if not wanted and s.alpha<0.003 then s.alpha=0;s.data=nil;return end
+    if wanted then s.data=extras.qucy_read(now,live) end
+    if not s.data then return end
+    for key,active in pairs(s.data.flags) do
+        local value=s.channels[key] or 0
+        s.channels[key]=value+((active and 1 or 0)-value)*step
+    end
+    extras.qucy_draw(s.data,s,now)
+end
+client.set_event_callback("paint_ui",extras.qucy_paint)
 extras.changed()
 
 -- Kupetis
